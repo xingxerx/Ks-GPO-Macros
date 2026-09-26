@@ -225,6 +225,7 @@ class ConfigurationManager:
                     'CastHoldDuration': 0.1,
                     'RecastTimeout': 25.0,
                     'FishEndDelay': 0.5,
+                    'CatchEndGrace': 0.25,
                     'StateResendInterval': 0.5
                 },
                 'Detection': {
@@ -1751,7 +1752,7 @@ class FishingMinigameController:
         # otherwise the loop recasts and swaps items while the fish is still hooked
         if self.BarMissingSince is None:
             self.BarMissingSince = Now
-        if Now - self.BarMissingSince < 0.4:
+        if Now - self.BarMissingSince < self.Config.Settings['FishingControl']['Timing'].get('CatchEndGrace', 0.25):
             return True
         self.SetMouse(False, Now)
         return False
@@ -3057,6 +3058,7 @@ class AutomatedFishingSystem:
             "castHoldDuration": self.Config.Settings['FishingControl']['Timing']['CastHoldDuration'],
             "recastTimeout": self.Config.Settings['FishingControl']['Timing']['RecastTimeout'],
             "fishEndDelay": self.Config.Settings['FishingControl']['Timing']['FishEndDelay'],
+            "catchEndGrace": self.Config.Settings['FishingControl']['Timing'].get('CatchEndGrace', 0.25),
             "loopsPerPurchase": self.Config.Settings['AutomationFrequencies']['LoopsPerPurchase'],
             "pdApproachingDamping": self.Config.Settings['FishingControl']['PdController']['PdApproachingDamping'],
             "pdChasingDamping": self.Config.Settings['FishingControl']['PdController']['PdChasingDamping'],
@@ -3513,6 +3515,7 @@ def ProcessCommand():
             'set_cast_hold': lambda: HandleFloatValue('FishingControl.Timing.CastHoldDuration'),
             'set_recast_timeout': lambda: HandleFloatValue('FishingControl.Timing.RecastTimeout'),
             'set_fish_end_delay': lambda: HandleFloatValue('FishingControl.Timing.FishEndDelay'),
+            'set_catch_end_grace': lambda: HandleFloatValue('FishingControl.Timing.CatchEndGrace'),
             'set_state_resend': lambda: HandleFloatValue('FishingControl.Timing.StateResendInterval'),
             'set_focus_delay': lambda: HandleFloatValue('TimingDelays.RobloxWindow.RobloxFocusDelay'),
             'set_post_focus_delay': lambda: HandleFloatValue('TimingDelays.RobloxWindow.RobloxPostFocusDelay'),

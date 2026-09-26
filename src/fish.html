@@ -714,10 +714,6 @@
             <div class="row-ctrl"><input type="number" class="inp" id="castHold" value="1.0" step="0.1"
                 onchange="sendToPython('set_cast_hold',this.value)"><span class="unit">sec</span></div>
           </div>
-          <div class="row-item"><span class="row-label">Recast Timeout</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="recastTimeout" value="30.0" step="1.0"
-                onchange="sendToPython('set_recast_timeout',this.value)"><span class="unit">sec</span></div>
-          </div>
         </div>
 
         <div class="section-title">Anti-Detection</div>
@@ -739,12 +735,24 @@
           <p>Fine-tune all delay intervals</p>
         </div>
 
-        <div class="section-title">Core</div>
+        <div class="section-title">Recast</div>
         <div class="panel">
+          <div class="row-item"><span class="row-label">Catch End Grace</span>
+            <div class="row-ctrl"><input type="number" class="inp" id="catchEndGrace" value="0.25" step="0.05"
+                onchange="sendToPython('set_catch_end_grace',this.value)"><span class="unit">sec</span></div>
+          </div>
           <div class="row-item"><span class="row-label">Fish Completion Delay</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="fishEndDelay" value="2.0" step="0.1"
+            <div class="row-ctrl"><input type="number" class="inp" id="fishEndDelay" value="0.15" step="0.05"
                 onchange="sendToPython('set_fish_end_delay',this.value)"><span class="unit">sec</span></div>
           </div>
+          <div class="row-item"><span class="row-label">Bobber Timeout (Recast)</span>
+            <div class="row-ctrl"><input type="number" class="inp" id="recastTimeout" value="30.0" step="1.0"
+                onchange="sendToPython('set_recast_timeout',this.value)"><span class="unit">sec</span></div>
+          </div>
+        </div>
+
+        <div class="section-title">Core</div>
+        <div class="panel">
           <div class="row-item"><span class="row-label">State Resend Interval</span>
             <div class="row-ctrl"><input type="number" class="inp" id="stateResend" value="0.5" step="0.05"
                 onchange="sendToPython('set_state_resend',this.value)"><span class="unit">sec</span></div>

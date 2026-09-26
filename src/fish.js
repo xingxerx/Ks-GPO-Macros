@@ -741,6 +741,7 @@ function loadAllSettings(state) {
     setInputValue('castHold', state.castHoldDuration);
     setInputValue('recastTimeout', state.recastTimeout);
     setInputValue('fishEndDelay', state.fishEndDelay);
+    setInputValue('catchEndGrace', state.catchEndGrace);
     setInputValue('stateResend', state.stateResendInterval);
     setInputValue('loopsPerPurchase', state.loopsPerPurchase);
     setInputValue('loopsPerStore', state.loopsPerStore);

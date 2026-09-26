@@ -244,8 +244,9 @@
         },
         "Timing": {
             "CastHoldDuration": 0.05,
-            "RecastTimeout": 25.0,
+            "RecastTimeout": 17.0,
             "FishEndDelay": 0.15,
+            "CatchEndGrace": 0.25,
             "StateResendInterval": 0.5
         },
         "Detection": {

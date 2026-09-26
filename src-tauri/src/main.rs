@@ -226,12 +226,31 @@ fn read_backend_port(res_dir: &PathBuf, pid: u32) -> u16 {
     8765
 }
 
+// Localhost calls use ureq: reqwest::blocking spins up a runtime thread per client,
+// and that thread overflowed its stack when the macro started
+fn local_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+    })
+}
+
+fn fetch_state(port: u16) -> Option<serde_json::Value> {
+    local_agent()
+        .get(&format!("http://127.0.0.1:{port}/state"))
+        .call()
+        .ok()?
+        .into_json()
+        .ok()
+}
+
 fn wait_for_backend(port: u16) -> bool {
     log(&format!("Waiting for backend on port {port}..."));
-    let client = reqwest::blocking::Client::new();
     for i in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        if client.get(&format!("http://localhost:{port}/health")).send().is_ok() {
+        if local_agent().get(&format!("http://127.0.0.1:{port}/health")).call().is_ok() {
             log(&format!("Backend ready after {} attempts", i + 1));
             return true;
         }
@@ -391,14 +410,11 @@ fn setup_main_window(app: &AppHandle, backend_port: u16, launcher_pid: u32) {
 
     let win_clone2 = win.clone();
     std::thread::spawn(move || {
-        let client = reqwest::blocking::Client::new();
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            if let Ok(res) = client.get(&format!("http://localhost:{backend_port}/state")).send() {
-                if let Ok(state) = res.json::<serde_json::Value>() {
-                    if let Some(on_top) = state.get("alwaysOnTop").and_then(|v| v.as_bool()) {
-                        let _ = win_clone2.set_always_on_top(on_top);
-                    }
+            if let Some(state) = fetch_state(backend_port) {
+                if let Some(on_top) = state.get("alwaysOnTop").and_then(|v| v.as_bool()) {
+                    let _ = win_clone2.set_always_on_top(on_top);
                 }
             }
         }
@@ -522,14 +538,11 @@ fn setup_stats_window(app: &AppHandle, backend_port: u16) {
     });
 
     std::thread::spawn(move || {
-        let client = reqwest::blocking::Client::new();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
-            if let Ok(res) = client.get(&format!("http://localhost:{backend_port}/state")).send() {
-                if let Ok(state) = res.json::<serde_json::Value>() {
-                    let show = state.get("showDebugOverlay").and_then(|v| v.as_bool()).unwrap_or(false);
-                    if show { let _ = stats_win.show(); } else { let _ = stats_win.hide(); }
-                }
+            if let Some(state) = fetch_state(backend_port) {
+                let show = state.get("showDebugOverlay").and_then(|v| v.as_bool()).unwrap_or(false);
+                if show { let _ = stats_win.show(); } else { let _ = stats_win.hide(); }
             }
         }
     });
@@ -552,10 +565,9 @@ fn send_to_python(app: AppHandle, action: String, payload: String) -> Result<Str
         .and_then(|p| p.0.lock().ok().map(|g| *g))
         .unwrap_or(8765);
 
-    reqwest::blocking::Client::new()
-        .post(format!("http://localhost:{port}/command"))
-        .json(&serde_json::json!({ "action": action, "payload": payload }))
-        .send()
+    local_agent()
+        .post(&format!("http://127.0.0.1:{port}/command"))
+        .send_json(serde_json::json!({ "action": action, "payload": payload }))
         .map(|_| "Success".to_string())
         .map_err(|e| e.to_string())
 }
