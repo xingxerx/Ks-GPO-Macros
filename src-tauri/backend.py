@@ -1654,156 +1654,144 @@ class FishingMinigameController:
 
         return False
     
-    def ControlMinigame(self):
-        ScanArea = self.Config.Settings['ScanArea']
-        
-        with mss.mss() as Capture:
-            Region = {
-                "top": ScanArea["Y1"],
-                "left": ScanArea["X1"],
-                "width": ScanArea["X2"] - ScanArea["X1"],
-                "height": ScanArea["Y2"] - ScanArea["Y1"]
-            }
-            Screenshot = Capture.grab(Region)
-            Image = np.array(Screenshot)
-        
-        if ColorDetector.DetectBlackScreen(ScanArea, Image):
-            if self.State.MousePressed:
-                try:
-                    pyautogui.mouseUp()
-                    self.State.MousePressed = False
-                except:
-                    pass
-            time.sleep(0.2)
-            return True
-        
-        BlueColor = np.array([85, 170, 255])
-        BlueMask = ((Image[:, :, 2] == BlueColor[0]) & 
-                   (Image[:, :, 1] == BlueColor[1]) & 
-                   (Image[:, :, 0] == BlueColor[2]))
-        
-        if not np.any(BlueMask):
-            if self.State.MousePressed:
-                pyautogui.mouseUp()
-                self.State.MousePressed = False
-            return False
-        
-        BlueY, BlueX = np.where(BlueMask)
-        CenterX = int(np.mean(BlueX))
-        
-        Slice = Image[:, CenterX:CenterX+1, :]
-        
-        GrayColor = np.array([25, 25, 25])
-        GrayMask = ((Slice[:, 0, 2] == GrayColor[0]) & 
-                   (Slice[:, 0, 1] == GrayColor[1]) & 
-                   (Slice[:, 0, 0] == GrayColor[2]))
-        
-        if not np.any(GrayMask):
-            return True
-        
-        GrayY = np.where(GrayMask)[0]
-        TopBound = GrayY[0]
-        BottomBound = GrayY[-1]
-        BoundedSlice = Slice[TopBound:BottomBound+1, :, :]
-        
-        WhiteColor = np.array([255, 255, 255])
-        WhiteMask = ((BoundedSlice[:, 0, 2] == WhiteColor[0]) & 
-                    (BoundedSlice[:, 0, 1] == WhiteColor[1]) & 
-                    (BoundedSlice[:, 0, 0] == WhiteColor[2]))
-        
-        if not np.any(WhiteMask):
-            if not self.State.MousePressed:
-                pyautogui.mouseDown()
-                self.State.MousePressed = True
-            return True
-        
-        WhiteY = np.where(WhiteMask)[0]
-        WhiteTop = WhiteY[0]
-        WhiteBottom = WhiteY[-1]
-        WhiteHeight = WhiteBottom - WhiteTop + 1
-        WhiteCenter = (WhiteTop + WhiteBottom) // 2
-        WhiteCenterScreenY = ScanArea["Y1"] + TopBound + WhiteCenter
-        
-        DarkGrayColor = np.array([25, 25, 25])
-        DarkGrayMask = ((BoundedSlice[:, 0, 2] == DarkGrayColor[0]) & 
-                       (BoundedSlice[:, 0, 1] == DarkGrayColor[1]) & 
-                       (BoundedSlice[:, 0, 0] == DarkGrayColor[2]))
-        
-        if not np.any(DarkGrayMask):
-            if not self.State.MousePressed:
-                pyautogui.mouseDown()
-                self.State.MousePressed = True
-            return True
-        
-        DarkGrayY = np.where(DarkGrayMask)[0]
-        MaxGap = WhiteHeight * self.Config.Settings['FishingControl']['Detection']['GapToleranceMultiplier']
-        
-        Groups = []
-        CurrentGroup = [DarkGrayY[0]]
-        
-        for I in range(1, len(DarkGrayY)):
-            if DarkGrayY[I] - DarkGrayY[I-1] <= MaxGap:
-                CurrentGroup.append(DarkGrayY[I])
-            else:
-                Groups.append(CurrentGroup)
-                CurrentGroup = [DarkGrayY[I]]
-        
-        Groups.append(CurrentGroup)
-        
-        LargestGroup = max(Groups, key=len)
-        TargetCenter = (LargestGroup[0] + LargestGroup[-1]) // 2
-        TargetCenterScreenY = ScanArea["Y1"] + TopBound + TargetCenter
-        
-        Kp = self.Config.Settings['FishingControl']['PdController']['Kp']
-        Kd = self.Config.Settings['FishingControl']['PdController']['Kd']
-        MaxClamp = self.Config.Settings['FishingControl']['PdController']['PdClamp']
-        
-        Error = WhiteCenterScreenY - TargetCenterScreenY
-        PTerm = Kp * Error
-        DTerm = 0.0
-        
-        CurrentTime = time.time()
-        TimeDiff = CurrentTime - self.State.LastScanTime
-        
-        if self.State.PreviousError is not None and self.State.PreviousTargetY is not None and TimeDiff > 0.001:
-            TargetVelocity = (TargetCenterScreenY - self.State.PreviousTargetY) / TimeDiff
-            ErrorDecreasing = abs(Error) < abs(self.State.PreviousError)
-            TargetMovingToward = (TargetVelocity > 0 and Error > 0) or (TargetVelocity < 0 and Error < 0)
-            
-            if ErrorDecreasing and TargetMovingToward:
-                Damping = self.Config.Settings['FishingControl']['PdController']['PdApproachingDamping']
-                DTerm = -Kd * Damping * TargetVelocity
-            else:
-                Damping = self.Config.Settings['FishingControl']['PdController']['PdChasingDamping']
-                DTerm = -Kd * Damping * TargetVelocity
-        
-        ControlSignal = PTerm + DTerm
-        ControlSignal = max(-MaxClamp, min(MaxClamp, ControlSignal))
-        ShouldHold = ControlSignal <= 0
-        
-        if ShouldHold and not self.State.MousePressed:
+    def ResetMinigame(self):
+        self.BarLeft = None
+        self.BarRight = None
+        self.PrevWhiteY = None
+        self.PrevTargetY = None
+        self.WhiteVel = 0.0
+        self.TargetVel = 0.0
+        self.State.PreviousError = None
+        self.State.PreviousTargetY = None
+        self.State.LastScanTime = time.time()
+
+    def GetCapture(self):
+        # mss handles are thread-bound and slow to create, so keep one per thread
+        Local = getattr(self, '_CaptureLocal', None)
+        if Local is None:
+            Local = self._CaptureLocal = threading.local()
+        if getattr(Local, 'Sct', None) is None:
+            Local.Sct = mss.mss()
+        return Local.Sct
+
+    @staticmethod
+    def ColorMask(Pixels, Color):
+        # Pixels are BGRA, Color is RGB
+        return (Pixels[..., 2] == Color[0]) & (Pixels[..., 1] == Color[1]) & (Pixels[..., 0] == Color[2])
+
+    def SetMouse(self, Hold, Now):
+        if Hold and not self.State.MousePressed:
             pyautogui.mouseDown()
             self.State.MousePressed = True
-            self.State.LastStateChangeTime = CurrentTime
-            self.State.LastInputResendTime = CurrentTime
-        elif not ShouldHold and self.State.MousePressed:
+            self.State.LastInputResendTime = Now
+        elif not Hold and self.State.MousePressed:
             pyautogui.mouseUp()
             self.State.MousePressed = False
-            self.State.LastStateChangeTime = CurrentTime
-            self.State.LastInputResendTime = CurrentTime
+            self.State.LastInputResendTime = Now
+        elif Now - getattr(self.State, 'LastInputResendTime', 0) >= self.Config.Settings['FishingControl']['Timing']['StateResendInterval']:
+            if self.State.MousePressed:
+                pyautogui.mouseDown()
+            else:
+                pyautogui.mouseUp()
+            self.State.LastInputResendTime = Now
+
+    def ControlMinigame(self):
+        ScanArea = self.Config.Settings['ScanArea']
+        Capture = self.GetCapture()
+        Height = ScanArea["Y2"] - ScanArea["Y1"]
+
+        if getattr(self, 'BarLeft', None) is None:
+            # First frame: locate the bar column in the full scan area, then only grab that strip afterwards
+            Image = np.array(Capture.grab({"top": ScanArea["Y1"], "left": ScanArea["X1"],
+                                           "width": ScanArea["X2"] - ScanArea["X1"], "height": Height}))
+            if ColorDetector.DetectBlackScreen(ScanArea, Image):
+                self.SetMouse(False, time.time())
+                time.sleep(0.2)
+                return True
+            BlueMask = self.ColorMask(Image, (85, 170, 255))
+            if not np.any(BlueMask):
+                self.SetMouse(False, time.time())
+                return False
+            BlueX = np.where(BlueMask)[1]
+            self.BarLeft = max(0, int(BlueX.min()) - 2)
+            self.BarRight = min(Image.shape[1], int(BlueX.max()) + 3)
+            self.BarCenter = int(np.mean(BlueX)) - self.BarLeft
+
+        Strip = np.array(Capture.grab({"top": ScanArea["Y1"], "left": ScanArea["X1"] + self.BarLeft,
+                                       "width": self.BarRight - self.BarLeft, "height": Height}))
+        Now = time.time()
+
+        if ColorDetector.DetectBlackScreen(ScanArea, Strip):
+            self.SetMouse(False, Now)
+            time.sleep(0.2)
+            return True
+
+        if not np.any(self.ColorMask(Strip, (85, 170, 255))):
+            self.SetMouse(False, Now)
+            return False
+
+        Column = Strip[:, self.BarCenter, :]
+        GrayY = np.where(self.ColorMask(Column, (25, 25, 25)))[0]
+        if len(GrayY) == 0:
+            return True
+
+        TopBound = GrayY[0]
+        Bounded = Column[TopBound:GrayY[-1] + 1]
+
+        WhiteY = np.where(self.ColorMask(Bounded, (255, 255, 255)))[0]
+        if len(WhiteY) == 0:
+            self.SetMouse(True, Now)
+            return True
+
+        WhiteHeight = WhiteY[-1] - WhiteY[0] + 1
+        WhiteCenter = TopBound + (WhiteY[0] + WhiteY[-1]) / 2.0
+
+        DarkGrayY = np.where(self.ColorMask(Bounded, (25, 25, 25)))[0]
+        if len(DarkGrayY) == 0:
+            self.SetMouse(True, Now)
+            return True
+
+        # Split the target line into contiguous groups (vectorised) and follow the largest
+        MaxGap = WhiteHeight * self.Config.Settings['FishingControl']['Detection']['GapToleranceMultiplier']
+        Breaks = np.where(np.diff(DarkGrayY) > MaxGap)[0] + 1
+        Groups = np.split(DarkGrayY, Breaks)
+        Largest = max(Groups, key=len)
+        TargetCenter = TopBound + (Largest[0] + Largest[-1]) / 2.0
+
+        Pd = self.Config.Settings['FishingControl']['PdController']
+        Dt = Now - self.State.LastScanTime
+
+        # Smoothed velocities of both the white bar and the target (px/s)
+        if self.PrevWhiteY is not None and Dt > 0.001:
+            Alpha = 0.5
+            self.WhiteVel = Alpha * ((WhiteCenter - self.PrevWhiteY) / Dt) + (1 - Alpha) * self.WhiteVel
+            self.TargetVel = Alpha * ((TargetCenter - self.PrevTargetY) / Dt) + (1 - Alpha) * self.TargetVel
+
+        Error = WhiteCenter - TargetCenter
+        ErrorRate = self.WhiteVel - self.TargetVel
+
+        # Lead compensation: act on where the error will be shortly, so the bar's momentum doesn't overshoot.
+        # Kd sets the look-ahead (Kd 0.6 -> ~60ms); damping picks more look-ahead when closing in, less when chasing.
+        Closing = (Error > 0 and ErrorRate < 0) or (Error < 0 and ErrorRate > 0)
+        Damping = Pd['PdApproachingDamping'] if Closing else Pd['PdChasingDamping']
+        LeadTime = Pd['Kd'] * 0.1 * Damping
+        ControlSignal = Pd['Kp'] * (Error + ErrorRate * LeadTime)
+
+        # Small deadband around the current state stops rapid click chatter when centred
+        Deadband = max(1.0, WhiteHeight * 0.05)
+        if abs(ControlSignal) < Deadband:
+            ShouldHold = self.State.MousePressed
         else:
-            ResendInterval = self.Config.Settings['FishingControl']['Timing']['StateResendInterval']
-            if CurrentTime - self.State.LastInputResendTime >= ResendInterval:
-                if self.State.MousePressed:
-                    pyautogui.mouseDown()
-                else:
-                    pyautogui.mouseUp()
-                self.State.LastInputResendTime = CurrentTime
-        
+            ShouldHold = ControlSignal < 0
+
+        self.SetMouse(ShouldHold, Now)
+
+        self.PrevWhiteY = WhiteCenter
+        self.PrevTargetY = TargetCenter
         self.State.PreviousError = Error
-        self.State.PreviousTargetY = TargetCenterScreenY
-        self.State.LastScanTime = CurrentTime
-        
+        self.State.PreviousTargetY = TargetCenter
+        self.State.LastScanTime = Now
+
         return True
 
 
@@ -2102,9 +2090,7 @@ class AutomatedFishingSystem:
 
                 self.State.UpdateStatus("Starting new fishing cycle")
                 LastActivity = time.time()
-                self.State.PreviousError = None
-                self.State.PreviousTargetY = None
-                self.State.LastScanTime = time.time()
+                self.MinigameController.ResetMinigame()
                 
                 if self.State.MousePressed:
                     self.State.UpdateStatus("Releasing mouse from previous cycle")
@@ -2792,21 +2778,29 @@ class AutomatedFishingSystem:
         time.sleep(Delays['BrewUseDelay'])
         self.State.UpdateStatus("Potion brew used successfully")
 
+    def TapKey(self, Key, HoldTime=0.05):
+        # Roblox drops zero-length taps; hold the key briefly so it registers
+        keyboard.press(Key)
+        time.sleep(HoldTime)
+        keyboard.release(Key)
+
     def EquipRod(self):
         if not self.State.IsRunning:
             return False
-        
+
+        # Rod key toggles, so first swap to another slot to guarantee the rod press equips instead of unequips
+        SelectDelay = max(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'], 0.25)
         self.State.UpdateStatus("Switching to Alternate Slot")
-        keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['Alternate'])
-        time.sleep(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'])
+        self.TapKey(self.Config.Settings['InventoryHotkeys']['Alternate'])
+        time.sleep(SelectDelay)
 
         if not self.State.IsRunning:
             return False
-        
+
         self.State.UpdateStatus("Switching to Fishing Rod")
-        keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['Rod'])
-        time.sleep(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'])
-        
+        self.TapKey(self.Config.Settings['InventoryHotkeys']['Rod'])
+        time.sleep(SelectDelay)
+
         return True
     
     def UnequipAll(self):
@@ -2814,19 +2808,19 @@ class AutomatedFishingSystem:
             return False
         
         self.State.UpdateStatus("Un-Equipping all items")
-        keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['Alternate'])
+        self.TapKey(self.Config.Settings['InventoryHotkeys']['Alternate'])
         time.sleep(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'])
 
         if not self.State.IsRunning:
             return False
-        
-        keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['Rod'])
+
+        self.TapKey(self.Config.Settings['InventoryHotkeys']['Rod'])
         time.sleep(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'])
-        
+
         if not self.State.IsRunning:
             return False
-        
-        keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['Rod'])
+
+        self.TapKey(self.Config.Settings['InventoryHotkeys']['Rod'])
         time.sleep(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'])
 
         return True

@@ -32,3 +32,12 @@ src/juzo.js
 src-tauri/juzo.py
 /src-tauri/saved-hashes
 /src-tauri/hashes
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/

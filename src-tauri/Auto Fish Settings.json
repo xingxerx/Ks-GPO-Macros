@@ -4,46 +4,42 @@
         "Exit": "f3"
     },
     "WindowSettings": {
-        "AlwaysOnTop": false,
+        "AlwaysOnTop": true,
         "ShowDebugOverlay": true
     },
     "ScanArea": {
-        "X1": 1343,
-        "Y1": 420,
-        "X2": 1753,
-        "Y2": 1138,
-        "x1": 1258,
-        "y1": 492,
-        "x2": 1575,
-        "y2": 1074
+        "X1": 1807,
+        "Y1": 438,
+        "X2": 2217,
+        "Y2": 1200
     },
     "ClickPoints": {
         "WaterPoint": {
-            "x": 1337,
-            "y": 488
+            "x": 1612,
+            "y": 521
         },
         "Shop": {
             "LeftPoint": {
-                "x": 1046,
-                "y": 1296
+                "x": 1485,
+                "y": 1304
             },
             "MiddlePoint": {
-                "x": 1282,
-                "y": 1299
+                "x": 1715,
+                "y": 1305
             },
             "RightPoint": {
-                "x": 1515,
-                "y": 1295
+                "x": 1940,
+                "y": 1300
             }
         },
         "BaitPoint": {
-            "x": 1289,
-            "y": 1161
+            "x": 1723,
+            "y": 1063
         },
         "DevilFruit": {
             "StoreFruitPoint": {
-                "x": 1291,
-                "y": 1147
+                "x": 1713,
+                "y": 1148
             },
             "BackpackLocations": [
                 {
@@ -171,18 +167,14 @@
         }
     },
     "InventoryHotkeys": {
-        "RodHotkey": "0",
-        "AnythingElseHotkey": "1",
-        "PotionBrewSlot": "2",
+        "RodHotkey": "1",
+        "AnythingElseHotkey": "4",
+        "PotionBrewSlot": "5",
         "DevilFruitHotkeys": [
+            "2",
             "3",
-            "4",
-            "6",
-            "7",
-            "8",
             "5",
-            "9",
-            "2"
+            "6"
         ]
     },
     "AutomationFeatures": {
@@ -195,7 +187,7 @@
     },
     "AutomationFrequencies": {
         "LoopsPerTopBait": 1,
-        "LoopsPerPurchase": 100,
+        "LoopsPerPurchase": 10,
         "LoopsPerStore": 50,
         "LoopsPerCraft": 5,
         "CraftsPerCycle": 40,
@@ -235,7 +227,7 @@
         "ResumeOnRDPReconnect": false
     },
     "DeviceSyncSettings": {
-        "EnableDeviceSync": false,
+        "EnableDeviceSync": true,
         "SyncSettings": true,
         "SyncStats": false,
         "ShareFishCount": false,
