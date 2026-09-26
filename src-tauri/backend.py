@@ -43,6 +43,43 @@ import cv2
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+LogDir = os.path.join(os.getcwd(), 'logs')
+VisionDir = os.path.join(LogDir, 'vision')
+os.makedirs(VisionDir, exist_ok=True)
+
+
+class TeeStream:
+    # Mirrors console output into logs/backend.txt so failures can be read after the fact
+    def __init__(self, Stream, File):
+        self.Stream = Stream
+        self.File = File
+
+    def write(self, Data):
+        try:
+            if self.Stream:
+                self.Stream.write(Data)
+            self.File.write(Data)
+            self.File.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            if self.Stream:
+                self.Stream.flush()
+        except Exception:
+            pass
+
+
+_LogFile = open(os.path.join(LogDir, 'backend.txt'), 'w', encoding='utf-8', errors='replace')
+sys.stdout = TeeStream(sys.stdout, _LogFile)
+sys.stderr = TeeStream(sys.stderr, _LogFile)
+
+
+def LogLine(Message):
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {Message}")
+
+
 def FindFreePort(Start=8765, MaxAttempts=50):
     for Port in range(Start, Start + MaxAttempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as S:
@@ -537,7 +574,8 @@ class MacroStateManager:
         self.RobloxWindowFocused = False
         self.FastModeEnabled = False
         self.MousePressed = False
-        
+        self.RodEquipped = False
+
         self.PreviousError = None
         self.PreviousTargetY = None
         self.LastScanTime = time.time()
@@ -561,6 +599,8 @@ class MacroStateManager:
         self.IsSyncing = False
     
     def UpdateStatus(self, Status):
+        if Status != self.CurrentStatus:
+            LogLine(f"STATUS {Status}")
         self.CurrentStatus = Status
     
     def IncrementFishCount(self):
@@ -1307,11 +1347,29 @@ class InputController:
         Windows = []
         win32gui.EnumWindows(FindRobloxWindow, Windows)
         
-        if Windows:
-            win32gui.SetForegroundWindow(Windows[0])
-            time.sleep(self.Config.Settings['TimingDelays']['RobloxWindow']['RobloxFocusDelay'])
+        if not Windows:
+            return False
+
+        Handle = Windows[0]
+        if win32gui.GetForegroundWindow() == Handle:
             return True
-        return False
+
+        try:
+            if win32gui.IsIconic(Handle):
+                win32gui.ShowWindow(Handle, win32con.SW_RESTORE)
+            # Windows refuses focus changes from background processes; a synthetic Alt tap lifts that lock
+            win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+            win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32gui.SetForegroundWindow(Handle)
+        except Exception as E:
+            LogLine(f"FocusRobloxWindow: SetForegroundWindow failed ({E}), trying BringWindowToTop")
+            try:
+                win32gui.BringWindowToTop(Handle)
+            except Exception:
+                pass
+
+        time.sleep(self.Config.Settings['TimingDelays']['RobloxWindow']['RobloxFocusDelay'])
+        return win32gui.GetForegroundWindow() == Handle
     
     def ClickPoint(self, Point):
         if not Point:
@@ -1664,6 +1722,39 @@ class FishingMinigameController:
         self.State.PreviousError = None
         self.State.PreviousTargetY = None
         self.State.LastScanTime = time.time()
+        self.BarMissingSince = None
+        self.SnapshotReasons = set()
+        self.LastTraceTime = 0.0
+        self.MinigameStart = time.time()
+
+    def Snapshot(self, Image, Reason):
+        # One screenshot per reason per minigame, capped per session, so the folder stays small
+        self.SnapshotCount = getattr(self, 'SnapshotCount', 0)
+        if Reason in self.SnapshotReasons or self.SnapshotCount >= 60:
+            return
+        self.SnapshotReasons.add(Reason)
+        self.SnapshotCount += 1
+        Path = os.path.join(VisionDir, f"{datetime.now().strftime('%H%M%S_%f')[:-3]}_{Reason}.png")
+        try:
+            cv2.imwrite(Path, Image)
+            LogLine(f"VISION snapshot {Reason} -> {Path}")
+        except Exception as E:
+            LogLine(f"VISION snapshot failed: {E}")
+
+    def Trace(self, Now, Message):
+        if Now - self.LastTraceTime >= 0.25:
+            self.LastTraceTime = Now
+            LogLine(f"MINIGAME t={Now - self.MinigameStart:.2f}s {Message}")
+
+    def BarMissing(self, Now):
+        # A single frame without the bar (flicker, capture tearing) must not end the minigame,
+        # otherwise the loop recasts and swaps items while the fish is still hooked
+        if self.BarMissingSince is None:
+            self.BarMissingSince = Now
+        if Now - self.BarMissingSince < 0.4:
+            return True
+        self.SetMouse(False, Now)
+        return False
 
     def GetCapture(self):
         # mss handles are thread-bound and slow to create, so keep one per thread
@@ -1700,39 +1791,34 @@ class FishingMinigameController:
         Capture = self.GetCapture()
         Height = ScanArea["Y2"] - ScanArea["Y1"]
 
-        if getattr(self, 'BarLeft', None) is None:
-            # First frame: locate the bar column in the full scan area, then only grab that strip afterwards
-            Image = np.array(Capture.grab({"top": ScanArea["Y1"], "left": ScanArea["X1"],
-                                           "width": ScanArea["X2"] - ScanArea["X1"], "height": Height}))
-            if ColorDetector.DetectBlackScreen(ScanArea, Image):
-                self.SetMouse(False, time.time())
-                time.sleep(0.2)
-                return True
-            BlueMask = self.ColorMask(Image, (85, 170, 255))
-            if not np.any(BlueMask):
-                self.SetMouse(False, time.time())
-                return False
-            BlueX = np.where(BlueMask)[1]
-            self.BarLeft = max(0, int(BlueX.min()) - 2)
-            self.BarRight = min(Image.shape[1], int(BlueX.max()) + 3)
-            self.BarCenter = int(np.mean(BlueX)) - self.BarLeft
-
-        Strip = np.array(Capture.grab({"top": ScanArea["Y1"], "left": ScanArea["X1"] + self.BarLeft,
-                                       "width": self.BarRight - self.BarLeft, "height": Height}))
+        Image = np.array(Capture.grab({"top": ScanArea["Y1"], "left": ScanArea["X1"],
+                                       "width": ScanArea["X2"] - ScanArea["X1"], "height": Height}))
         Now = time.time()
+        self.Snapshot(Image, 'start')
 
-        if ColorDetector.DetectBlackScreen(ScanArea, Strip):
+        if ColorDetector.DetectBlackScreen(ScanArea, Image):
+            self.Snapshot(Image, 'black_screen')
+            self.Trace(Now, "black screen -> release")
             self.SetMouse(False, Now)
             time.sleep(0.2)
             return True
 
-        if not np.any(self.ColorMask(Strip, (85, 170, 255))):
-            self.SetMouse(False, Now)
-            return False
+        BlueMask = self.ColorMask(Image, (85, 170, 255))
+        if not np.any(BlueMask):
+            self.Snapshot(Image, 'no_blue_bar')
+            Still = self.BarMissing(Now)
+            LogLine(f"MINIGAME blue bar not visible ({'waiting' if Still else 'ending minigame'})")
+            return Still
+        self.BarMissingSince = None
 
-        Column = Strip[:, self.BarCenter, :]
+        # Re-locate the bar column every frame so a shifted bar is still read correctly
+        CenterX = int(np.mean(np.where(BlueMask)[1]))
+        Column = Image[:, CenterX, :]
+
         GrayY = np.where(self.ColorMask(Column, (25, 25, 25)))[0]
         if len(GrayY) == 0:
+            self.Snapshot(Image, 'no_gray')
+            self.Trace(Now, f"no gray in column x={CenterX} -> keep state")
             return True
 
         TopBound = GrayY[0]
@@ -1740,54 +1826,61 @@ class FishingMinigameController:
 
         WhiteY = np.where(self.ColorMask(Bounded, (255, 255, 255)))[0]
         if len(WhiteY) == 0:
+            self.Snapshot(Image, 'no_white')
+            self.Trace(Now, f"no white in column x={CenterX} -> hold")
             self.SetMouse(True, Now)
             return True
 
         WhiteHeight = WhiteY[-1] - WhiteY[0] + 1
-        WhiteCenter = TopBound + (WhiteY[0] + WhiteY[-1]) / 2.0
+        WhiteCenter = TopBound + (WhiteY[0] + WhiteY[-1]) // 2
 
         DarkGrayY = np.where(self.ColorMask(Bounded, (25, 25, 25)))[0]
         if len(DarkGrayY) == 0:
+            self.Snapshot(Image, 'no_target')
+            self.Trace(Now, "no target line -> hold")
             self.SetMouse(True, Now)
             return True
 
-        # Split the target line into contiguous groups (vectorised) and follow the largest
+        # Split the target line into contiguous groups and follow the largest
         MaxGap = WhiteHeight * self.Config.Settings['FishingControl']['Detection']['GapToleranceMultiplier']
         Breaks = np.where(np.diff(DarkGrayY) > MaxGap)[0] + 1
-        Groups = np.split(DarkGrayY, Breaks)
-        Largest = max(Groups, key=len)
-        TargetCenter = TopBound + (Largest[0] + Largest[-1]) / 2.0
+        Largest = max(np.split(DarkGrayY, Breaks), key=len)
+        TargetCenter = TopBound + (Largest[0] + Largest[-1]) // 2
 
         Pd = self.Config.Settings['FishingControl']['PdController']
-        Dt = Now - self.State.LastScanTime
 
-        # Smoothed velocities of both the white bar and the target (px/s)
-        if self.PrevWhiteY is not None and Dt > 0.001:
+        # Velocities are sampled over >=25ms windows: consecutive grabs often show the same frame,
+        # and dividing a 1px jump by a 1ms gap produced huge spikes that flipped the hold decision
+        if self.PrevWhiteY is None:
+            self.PrevWhiteY, self.PrevTargetY, self.VelSampleTime = WhiteCenter, TargetCenter, Now
+        elif Now - self.VelSampleTime >= 0.025:
+            Dt = Now - self.VelSampleTime
             Alpha = 0.5
-            self.WhiteVel = Alpha * ((WhiteCenter - self.PrevWhiteY) / Dt) + (1 - Alpha) * self.WhiteVel
-            self.TargetVel = Alpha * ((TargetCenter - self.PrevTargetY) / Dt) + (1 - Alpha) * self.TargetVel
+            RawWhite = max(-1500.0, min(1500.0, (WhiteCenter - self.PrevWhiteY) / Dt))
+            RawTarget = max(-1500.0, min(1500.0, (TargetCenter - self.PrevTargetY) / Dt))
+            self.WhiteVel = Alpha * RawWhite + (1 - Alpha) * self.WhiteVel
+            self.TargetVel = Alpha * RawTarget + (1 - Alpha) * self.TargetVel
+            self.PrevWhiteY, self.PrevTargetY, self.VelSampleTime = WhiteCenter, TargetCenter, Now
 
+        # Hold raises the catch zone (target); aim where fish line and zone will be shortly so momentum doesn't overshoot
         Error = WhiteCenter - TargetCenter
         ErrorRate = self.WhiteVel - self.TargetVel
-
-        # Lead compensation: act on where the error will be shortly, so the bar's momentum doesn't overshoot.
-        # Kd sets the look-ahead (Kd 0.6 -> ~60ms); damping picks more look-ahead when closing in, less when chasing.
         Closing = (Error > 0 and ErrorRate < 0) or (Error < 0 and ErrorRate > 0)
-        Damping = Pd['PdApproachingDamping'] if Closing else Pd['PdChasingDamping']
-        LeadTime = Pd['Kd'] * 0.1 * Damping
-        ControlSignal = Pd['Kp'] * (Error + ErrorRate * LeadTime)
+        LeadTime = Pd['Kd'] * 0.1 * (Pd['PdApproachingDamping'] if Closing else Pd['PdChasingDamping'])
+        Predicted = Error + ErrorRate * LeadTime
 
-        # Small deadband around the current state stops rapid click chatter when centred
-        Deadband = max(1.0, WhiteHeight * 0.05)
-        if abs(ControlSignal) < Deadband:
+        # Hysteresis: inside the deadband keep doing what we were doing, which stops click chatter when centred
+        Deadband = max(2.0, WhiteHeight * 0.5)
+        if abs(Predicted) < Deadband:
             ShouldHold = self.State.MousePressed
         else:
-            ShouldHold = ControlSignal < 0
-
+            ShouldHold = Predicted < 0
         self.SetMouse(ShouldHold, Now)
 
-        self.PrevWhiteY = WhiteCenter
-        self.PrevTargetY = TargetCenter
+        self.Trace(Now, f"x={CenterX} white={WhiteCenter} target={TargetCenter} err={Error} "
+                        f"vW={self.WhiteVel:.0f} vT={self.TargetVel:.0f} pred={Predicted:.1f} hold={ShouldHold} "
+                        f"groups={len(Breaks) + 1} bounds={TopBound}-{GrayY[-1]}")
+
         self.State.PreviousError = Error
         self.State.PreviousTargetY = TargetCenter
         self.State.LastScanTime = Now
@@ -1956,6 +2049,7 @@ class AutomatedFishingSystem:
             self.State.ClientStats[self.State.ClientId]["start_time"] = time.time()
             self.State.ClientStats[self.State.ClientId]["fish_caught"] = self.State.TotalFishCaught
             self.State.RobloxWindowFocused = False
+            self.State.RodEquipped = False
             self.State.ConsecutiveRecastTimeouts = 0
             self.State.LastPeriodicStatsTime = time.time()
             self.State.FishAtLastStats = self.State.TotalFishCaught
@@ -2133,6 +2227,7 @@ class AutomatedFishingSystem:
                         print(f"{self.State.ConsecutiveRecastTimeouts} consecutive recast timeouts - attempting pre-execution reset")
                         self.State.UpdateStatus(f"[{self.State.ConsecutiveRecastTimeouts} timeouts] Running pre-execution reset...")
                         self.State.RobloxWindowFocused = False
+                        self.State.RodEquipped = False
                         if not self.ExecutePreCast(ForcePreCast=True):
                             self.State.UpdateStatus("Pre-execution reset failed - continuing anyway")
                     
@@ -2221,6 +2316,7 @@ class AutomatedFishingSystem:
                 self.State.UpdateStatus(f"Recovering from error... ({ErrorCount}/{MaxConsecutiveErrors})")
                 time.sleep(2)
                 self.State.RobloxWindowFocused = False
+                self.State.RodEquipped = False
                 continue
         
         if self.State.SessionStartTime:
@@ -2581,6 +2677,7 @@ class AutomatedFishingSystem:
 
         elif Points['StoreFruit']:
             for Slot in DevilFruitSlots:
+                self.State.RodEquipped = False
                 keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['Alternate'])
                 time.sleep(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'])
 
@@ -2753,6 +2850,7 @@ class AutomatedFishingSystem:
         if not self.State.IsRunning:
             return False
 
+        self.State.RodEquipped = False
         keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['PotionBrewSlot'])
 
         if not self.State.IsRunning:
@@ -2788,6 +2886,10 @@ class AutomatedFishingSystem:
         if not self.State.IsRunning:
             return False
 
+        # Pressing the rod key again would unequip it, so skip when nothing has switched slots since the last equip
+        if self.State.RodEquipped:
+            return True
+
         # Rod key toggles, so first swap to another slot to guarantee the rod press equips instead of unequips
         SelectDelay = max(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'], 0.25)
         self.State.UpdateStatus("Switching to Alternate Slot")
@@ -2801,6 +2903,7 @@ class AutomatedFishingSystem:
         self.TapKey(self.Config.Settings['InventoryHotkeys']['Rod'])
         time.sleep(SelectDelay)
 
+        self.State.RodEquipped = True
         return True
     
     def UnequipAll(self):
@@ -2808,6 +2911,7 @@ class AutomatedFishingSystem:
             return False
         
         self.State.UpdateStatus("Un-Equipping all items")
+        self.State.RodEquipped = False
         self.TapKey(self.Config.Settings['InventoryHotkeys']['Alternate'])
         time.sleep(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'])
 

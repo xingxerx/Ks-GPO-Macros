@@ -8,10 +8,10 @@
         "ShowDebugOverlay": true
     },
     "ScanArea": {
-        "X1": 1807,
-        "Y1": 438,
-        "X2": 2217,
-        "Y2": 1200
+        "X1": 1819,
+        "Y1": 429,
+        "X2": 2229,
+        "Y2": 1191
     },
     "ClickPoints": {
         "WaterPoint": {
@@ -168,13 +168,13 @@
     },
     "InventoryHotkeys": {
         "RodHotkey": "1",
-        "AnythingElseHotkey": "4",
+        "AnythingElseHotkey": "2",
         "PotionBrewSlot": "5",
         "DevilFruitHotkeys": [
-            "2",
             "3",
             "5",
-            "6"
+            "6",
+            "4"
         ]
     },
     "AutomationFeatures": {
@@ -198,10 +198,10 @@
     },
     "DevilFruitStorage": {
         "StoreToBackpack": false,
-        "WebhookUrl": "https://discord.com/api/webhooks/1474191896082645118/ZneBKz7hDRqzxRKILM4nAuu6uYcrFfVxEXMJRVulQw3KXeAV9H2pDVFMcNPA6dw31IFm"
+        "WebhookUrl": ""
     },
     "LoggingOptions": {
-        "DiscordUserId": "1351127835175288893",
+        "DiscordUserId": "",
         "LogDevilFruit": true,
         "PingDevilFruit": true,
         "LogRecastTimeouts": true,

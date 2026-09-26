@@ -192,6 +192,18 @@ fn spawn_backend_process(app: &AppHandle, launcher_pid: u32, script_name: &str) 
         .unwrap_or_else(|e| panic!("Failed to spawn backend ({script_name}): {e}"))
 }
 
+// Dev builds prefer the project's .venv so the backend never runs under a Python missing its packages
+#[cfg(debug_assertions)]
+fn dev_python() -> PathBuf {
+    let venv = if cfg!(target_os = "windows") { "../.venv/Scripts/python.exe" } else { "../.venv/bin/python" };
+    let venv = PathBuf::from(venv);
+    if venv.exists() {
+        return venv;
+    }
+    log("dev_python: .venv not found, falling back to python on PATH");
+    PathBuf::from(if cfg!(target_os = "windows") { "python" } else { "python3" })
+}
+
 fn read_backend_port(res_dir: &PathBuf, pid: u32) -> u16 {
     let res_dir = normalize_path(res_dir);
     let port_file = res_dir.join(format!("port_{pid}.json"));
@@ -639,7 +651,7 @@ fn launch_macro(app: AppHandle, macro_name: String) -> Result<serde_json::Value,
 
     #[cfg(debug_assertions)]
     {
-        let python_cmd = if cfg!(target_os = "windows") { "python" } else { "python3" };
+        let python_cmd = dev_python();
         let child = Command::new(python_cmd)
             .arg(script_name)
             .arg("--pid")
@@ -704,7 +716,7 @@ fn start_backend(app: AppHandle) -> Result<serde_json::Value, String> {
 
     #[cfg(debug_assertions)]
     {
-        let python_cmd = if cfg!(target_os = "windows") { "python" } else { "python3" };
+        let python_cmd = dev_python();
         let child = Command::new(python_cmd)
             .arg("backend.pyc")
             .arg("--pid")
