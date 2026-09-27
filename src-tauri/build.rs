@@ -305,5 +305,11 @@ fn main() {
         }
     }
 
+    // Native threads (WebView2, window callbacks) take their stack size from the exe header, 1 MB by default.
+    // One of them overflowed ("thread '<unknown>' has overflowed its stack"), so reserve 8 MB instead
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+    }
+
     tauri_build::build();
 }

@@ -490,7 +490,7 @@ fn setup_stats_window(app: &AppHandle, backend_port: u16) {
         let scale  = monitor.scale_factor();
         let msize  = monitor.size();
         let default_width  = (msize.width  as f64 / scale * 0.125) as u32;
-        let default_height = (msize.height as f64 / scale * 0.1)   as u32 + 6;
+        let default_height = (msize.height as f64 / scale * 0.135) as u32 + 6;
         let saved_w = store.get("w").and_then(|v: serde_json::Value| v.as_f64());
         let saved_h = store.get("h").and_then(|v: serde_json::Value| v.as_f64());
         let (width, height) = match (saved_w, saved_h) {
@@ -541,7 +541,10 @@ fn setup_stats_window(app: &AppHandle, backend_port: u16) {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             if let Some(state) = fetch_state(backend_port) {
-                let show = state.get("showDebugOverlay").and_then(|v| v.as_bool()).unwrap_or(false);
+                // Only show the overlay while the macro is actually running
+                let enabled = state.get("showDebugOverlay").and_then(|v| v.as_bool()).unwrap_or(false);
+                let running = state.get("isRunning").and_then(|v| v.as_bool()).unwrap_or(false);
+                let show = enabled && running;
                 if show { let _ = stats_win.show(); } else { let _ = stats_win.hide(); }
             }
         }

@@ -15,8 +15,8 @@
     },
     "ClickPoints": {
         "WaterPoint": {
-            "x": 1635,
-            "y": 563
+            "x": 1582,
+            "y": 449
         },
         "Shop": {
             "LeftPoint": {
@@ -33,13 +33,13 @@
             }
         },
         "BaitPoint": {
-            "x": 1676,
-            "y": 1108
+            "x": 1706,
+            "y": 1112
         },
         "DevilFruit": {
             "StoreFruitPoint": {
-                "x": 1717,
-                "y": 1144
+                "x": 1713,
+                "y": 1148
             },
             "BackpackLocations": [
                 {
@@ -178,18 +178,18 @@
         ]
     },
     "AutomationFeatures": {
-        "AutoBuyCommonBait": true,
+        "AutoBuyCommonBait": false,
         "AutoStoreDevilFruit": true,
-        "AutoSelectTopBait": true,
-        "SmartBaitSelect": true,
+        "AutoSelectTopBait": false,
+        "SmartBaitSelect": false,
         "AutoUsePotionBrew": false,
         "AutoCraftBait": false,
         "AutoSellFish": false
     },
     "AutomationFrequencies": {
         "LoopsPerTopBait": 20,
-        "LoopsPerPurchase": 20,
-        "LoopsPerStore": 1,
+        "LoopsPerPurchase": 10,
+        "LoopsPerStore": 50,
         "LoopsPerCraft": 5,
         "CraftsPerCycle": 40,
         "FishCountPerCraft": 0,
@@ -304,16 +304,16 @@
         "PingSpawns": true
     },
     "OCRSettings": {
-        "X1": 1204,
+        "X1": 1017,
         "Y1": 32,
-        "X2": 2236,
+        "X2": 1529,
         "Y2": 323
     },
     "BaitSelector": {
         "TierOrder": [
+            "Common Fish Bait",
             "Rare Fish Bait",
-            "Legendary Fish Bait",
-            "Common Fish Bait"
+            "Legendary Fish Bait"
         ],
         "Region": {
             "X1": 1373,

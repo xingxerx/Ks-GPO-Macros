@@ -62,6 +62,21 @@
             text-align: right;
         }
 
+        .RarityLine {
+            display: flex;
+            justify-content: space-between;
+            gap: 0.5em;
+            margin-bottom: 0.4em;
+            font-size: 0.85em;
+        }
+
+        .Rarity-Common { color: #9ca3af; }
+        .Rarity-Rare { color: #3b82f6; }
+        .Rarity-Epic { color: #a855f7; }
+        .Rarity-Legendary { color: #f59e0b; }
+        .Rarity-Mythical { color: #ef4444; }
+        .Rarity-Unknown { color: #666; }
+
         .StatusLine {
             margin-top: 0.7em;
             padding-top: 0.7em;
@@ -105,6 +120,17 @@
         <div class="StatLine">
             <span class="StatLabel">Devil Fruits</span>
             <span class="DevilFruitValue" id="DevilFruitCount">0</span>
+        </div>
+        <div class="RarityLine" title="Common / Rare / Epic / Legendary / Mythical">
+            <span class="Rarity-Common">C <span id="RarityCommon">0</span></span>
+            <span class="Rarity-Rare">R <span id="RarityRare">0</span></span>
+            <span class="Rarity-Epic">E <span id="RarityEpic">0</span></span>
+            <span class="Rarity-Legendary">L <span id="RarityLegendary">0</span></span>
+            <span class="Rarity-Mythical">M <span id="RarityMythical">0</span></span>
+        </div>
+        <div class="StatLine">
+            <span class="StatLabel">Last Fruit</span>
+            <span class="StatValue" id="LastFruit">-</span>
         </div>
         <div class="StatLine">
             <span class="StatLabel">Time</span>
@@ -163,6 +189,14 @@
 
                 document.getElementById('FishCount').textContent = State.fishCaught || 0;
                 document.getElementById('DevilFruitCount').textContent = State.devilFruitsCaught || 0;
+                const ByRarity = State.devilFruitsByRarity || {};
+                ['Common', 'Rare', 'Epic', 'Legendary', 'Mythical'].forEach(R => {
+                    document.getElementById(`Rarity${R}`).textContent = ByRarity[R] || 0;
+                });
+                const Last = State.lastDevilFruit;
+                const LastEl = document.getElementById('LastFruit');
+                LastEl.textContent = Last ? Last.name : '-';
+                LastEl.className = Last ? `Rarity-${Last.rarity}` : 'StatValue';
                 document.getElementById('TimeElapsed').textContent = State.timeElapsed || '0:00:00';
                 document.getElementById('FishPerHour').textContent = (State.fishPerHour || 0).toFixed(1);
                 document.getElementById('CurrentStatus').textContent = State.currentStatus || 'Idle';
@@ -174,7 +208,7 @@
         InitStatsPort();
 
         function ScaleToWindow() {
-            const scale = Math.min(window.innerWidth / 200, window.innerHeight / 170);
+            const scale = Math.min(window.innerWidth / 200, window.innerHeight / 230);
             document.documentElement.style.fontSize = Math.max(7, Math.min(18, scale * 14)) + 'px';
         }
 

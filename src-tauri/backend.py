@@ -577,6 +577,11 @@ class MacroStateManager:
         
         self.TotalFishCaught = 0
         self.TotalDevilFruits = 0
+        self.DevilFruitsByRarity = dict.fromkeys(FruitRarityOrder + ["Unknown"], 0)
+        self.LastDevilFruit = None
+        # Fruits counted at catch time that the store cycle hasn't handled yet, so storing them doesn't count twice
+        self.FruitsCountedBeforeStore = []
+        self.LastCaughtFruitTime = 0
         self.CumulativeUptime = 0
         self.SessionStartTime = None
         self.LastFishCaptureTime = None
@@ -597,6 +602,7 @@ class MacroStateManager:
         # Smart bait tracking: remaining is decremented per cast and triggers a rescan at zero
         self.SelectedBait = None
         self.BaitRemaining = None
+        self.SelectedBaitPoint = None
         self.BaitRescanNeeded = True
         self.LastBaitPurchaseTime = 0
         
@@ -637,8 +643,18 @@ class MacroStateManager:
         self.FishSinceLastCraft += 1
         self.LastFishCaptureTime = time.time()
 
-    def IncrementDevilFruitCount(self):
+    def IncrementDevilFruitCount(self, FruitName=None):
+        Rarity = FruitRarities.get(FruitName, "Unknown")
         self.TotalDevilFruits += 1
+        self.DevilFruitsByRarity[Rarity] += 1
+        self.LastDevilFruit = {"name": FruitName or "Unknown", "rarity": Rarity}
+        return Rarity
+
+    def ResetDevilFruitCounts(self):
+        self.TotalDevilFruits = 0
+        self.DevilFruitsByRarity = dict.fromkeys(self.DevilFruitsByRarity, 0)
+        self.LastDevilFruit = None
+        self.FruitsCountedBeforeStore = []
     
     def HandleRecastTimeout(self):
         self.TotalRecastTimeouts += 1
@@ -739,19 +755,28 @@ class OCRManager:
         return True
 
 
+FruitRarityOrder = ["Common", "Rare", "Epic", "Legendary", "Mythical"]
+
+FruitRarities = {
+    **dict.fromkeys(["Suke", "Kilo", "Spin", "Heal"], "Common"),
+    **dict.fromkeys(["Bari", "Mero", "Horo", "Gomu", "Bomu"], "Rare"),
+    **dict.fromkeys(["Yomi", "Spring", "Kira"], "Epic"),
+    **dict.fromkeys(["Mera", "Pika", "Hie", "Magu", "Goro", "Gura", "Zushi", "Suna", "Ito",
+                     "Paw", "Yuki", "Kage", "Yami", "Goru", "Smoke", "Biscuit"], "Legendary"),
+    **dict.fromkeys(["Tori", "Mochi", "Ope", "Venom", "Buddha", "Pteranodon",
+                     "Dragon", "Soul", "Leopard"], "Mythical"),
+}
+
+
 class DevilFruitDetector:
-    
+
     def __init__(self, OcrManager, Config):
         self.OcrManager = OcrManager
         self.Config = Config
-        self.KnownFruits = {
-            "Soul", "Dragon", "Mochi", "Ope", "Tori", "Buddha",
-            "Pika", "Kage", "Magu", "Gura", "Yuki", "Smoke",
-            "Goru", "Suna", "Mera", "Goro", "Ito", "Paw",
-            "Yami", "Zushi", "Kira", "Spring", "Yomi",
-            "Bomu", "Bari", "Mero", "Horo", "Gomu", "Suke", "Heal",
-            "Kilo", "Spin", "Hie", "Venom", "Pteranodon",
-        }
+        self.KnownFruits = set(FruitRarities)
+        # Raw OCR text and capture from the last DetectNewItem call, for diagnosing missed fruits
+        self.LastRawText = ""
+        self.LastScanImage = None
     
     def DetectNewItem(self):
         try:
@@ -779,25 +804,30 @@ class DevilFruitDetector:
             W, H = Img.size
             Img = Img.resize((W * 3, H * 3), PILImage.LANCZOS)
             ImgCV = np.array(Img)
-            Gray = cv2.cvtColor(ImgCV, cv2.COLOR_RGB2GRAY)
+            # Brightest channel instead of luminance, so rarity-coloured names (red, purple, blue) survive the threshold
+            Gray = ImgCV.max(axis=2).astype(np.uint8)
             _, WhiteOnly = cv2.threshold(Gray, 180, 255, cv2.THRESH_BINARY)
             Kernel = np.ones((2, 2), np.uint8)
             Dilated = cv2.dilate(WhiteOnly, Kernel, iterations=1)
             ProcessedImage = cv2.cvtColor(Dilated, cv2.COLOR_GRAY2RGB)
 
-            Results = self.OcrManager.Reader.readtext(
-                ProcessedImage,
-                detail=1,
-                paragraph=True,
-                text_threshold=0.6,
-                contrast_ths=0.1,
-                adjust_contrast=0.8,
-                blocklist='@#$%^&*()+=[]{}|\\~`',
-            )
+            with self.OcrManager.Lock:
+                Results = self.OcrManager.Reader.readtext(
+                    ProcessedImage,
+                    detail=1,
+                    paragraph=True,
+                    text_threshold=0.6,
+                    contrast_ths=0.1,
+                    adjust_contrast=0.8,
+                    blocklist='@#$%^&*()+=[]{}|\\~`',
+                )
 
-            FullText = " ".join(Text for _, Text, Conf in Results if Conf > 0.4)
+            # paragraph=True makes easyocr return (box, text) without a confidence score
+            FullText = " ".join(R[1] for R in Results if len(R) < 3 or R[2] > 0.4)
             FullText = FullText.strip()
             FullTextLower = FullText.lower()
+            self.LastRawText = FullText
+            self.LastScanImage = ImageRGB
 
             HasNew = any(Keyword in FullTextLower for Keyword in [
                 'new', 'nev', 'ncv', 'ncw', 'naw', 'ner'
@@ -865,17 +895,19 @@ class DevilFruitDetector:
             Dilated = cv2.dilate(WhiteOnly, Kernel, iterations=1)
             ProcessedImage = cv2.cvtColor(Dilated, cv2.COLOR_GRAY2RGB)
 
-            Results = self.OcrManager.Reader.readtext(
-                ProcessedImage,
-                detail=1,
-                paragraph=True,
-                text_threshold=0.6,
-                contrast_ths=0.1,
-                adjust_contrast=0.8,
-                blocklist='@#$%^&*()+=[]{}|\\~`',
-            )
+            with self.OcrManager.Lock:
+                Results = self.OcrManager.Reader.readtext(
+                    ProcessedImage,
+                    detail=1,
+                    paragraph=True,
+                    text_threshold=0.6,
+                    contrast_ths=0.1,
+                    adjust_contrast=0.8,
+                    blocklist='@#$%^&*()+=[]{}|\\~`',
+                )
 
-            FullText = " ".join(Text for _, Text, Conf in Results if Conf > 0.4)
+            # paragraph=True makes easyocr return (box, text) without a confidence score
+            FullText = " ".join(R[1] for R in Results if len(R) < 3 or R[2] > 0.4)
             FullText = FullText.strip()
             FullTextLower = FullText.lower()
 
@@ -900,17 +932,15 @@ class DevilFruitDetector:
             return None
         
     def GetClosestFruit(self, Name, Cutoff=0.6):
-        KnownFruits = {
-            "Soul", "Dragon", "Mochi", "Ope", "Tori", "Buddha",
-            "Pika", "Kage", "Magu", "Gura", "Yuki", "Smoke",
-            "Goru", "Suna", "Mera", "Goro", "Ito", "Paw",
-            "Yami", "Zushi", "Kira", "Spring", "Yomi",
-            "Bomu", "Bari", "Mero", "Horo", "Gomu", "Suke", "Heal",
-            "Kilo", "Spin", "Hie", "Venom", "Pteranodon",
-        }
-
-        Matches = get_close_matches(Name, KnownFruits, n=1, cutoff=Cutoff)
+        Matches = get_close_matches(Name, self.KnownFruits, n=1, cutoff=Cutoff)
         return Matches[0] if Matches else None
+
+    def IdentifyStoredFruit(self):
+        # OCR the "new item" popup after storing; returns a known fruit name or None
+        if not self.OcrManager.Enabled:
+            return None
+        RawDetection = self.DetectNewItem()
+        return self.GetClosestFruit(RawDetection, Cutoff=0.6) if RawDetection else None
 
 
 class BaitListReader:
@@ -1059,7 +1089,7 @@ class WebhookNotifier:
                     Category = "general"
                     ShouldSend = LogOpts['LogGeneralUpdates']
                     PingUser = LogOpts['PingGeneralUpdates']
-                elif "devil fruit" in MessageLower and "stored successfully" in MessageLower:
+                elif "devil fruit" in MessageLower and ("stored successfully" in MessageLower or " caught!" in MessageLower):
                     Color = ColorFruit
                     Title = "🎣 Devil Fruit Found"
                     Category = "devil_fruit"
@@ -1792,12 +1822,8 @@ class FishingMinigameController:
     
     def WaitForBobber(self):
         StartTime = time.time()
-        BlueColor = np.array([85, 170, 255])
-        WhiteColor = np.array([255, 255, 255])
-        DarkGrayColor = np.array([25, 25, 25])
-        GreenColor = np.array([127, 255, 170])
-        GreenTolerance = 15
-        
+        BarFrames = 0
+
         ScanArea = self.Config.Settings['ScanArea']
         MaxTimeout = self.Config.Settings['FishingControl']['Timing']['RecastTimeout']
 
@@ -1826,25 +1852,13 @@ class FishingMinigameController:
                 continue
             else:
                 BlackScreenCount = 0
-            
-            BlueMask = ((Image[:, :, 2] == BlueColor[0]) & 
-                       (Image[:, :, 1] == BlueColor[1]) & 
-                       (Image[:, :, 0] == BlueColor[2]))
-            WhiteMask = ((Image[:, :, 2] == WhiteColor[0]) & 
-                        (Image[:, :, 1] == WhiteColor[1]) & 
-                        (Image[:, :, 0] == WhiteColor[2]))
-            DarkGrayMask = ((Image[:, :, 2] == DarkGrayColor[0]) & 
-                           (Image[:, :, 1] == DarkGrayColor[1]) & 
-                           (Image[:, :, 0] == DarkGrayColor[2]))
-            GreenMask = ((np.abs(Image[:, :, 2].astype(int) - GreenColor[0]) <= GreenTolerance) & 
-                        (np.abs(Image[:, :, 1].astype(int) - GreenColor[1]) <= GreenTolerance) & 
-                        (np.abs(Image[:, :, 0].astype(int) - GreenColor[2]) <= GreenTolerance))
-            
-            BlueDetected = np.any(BlueMask)
-            WhiteDetected = np.any(WhiteMask)
-            DarkGrayDetected = np.any(DarkGrayMask)
-            
-            if BlueDetected and WhiteDetected and DarkGrayDetected:
+
+            # Require a real bar (same check the minigame uses) on consecutive frames. Matching single pixels
+            # anywhere fired on stray blue in the water right after casting, so the next cycle's cast click
+            # reeled the fresh line back in
+            Reading, _ = self.LocateBar(Image)
+            BarFrames = BarFrames + 1 if Reading else 0
+            if BarFrames >= 2:
                 return True
             
             SleepTime = self.Config.Settings['FishingControl']['Detection']['ScanLoopDelay']
@@ -1912,6 +1926,69 @@ class FishingMinigameController:
         # Pixels are BGRA, Color is RGB
         return (Pixels[..., 2] == Color[0]) & (Pixels[..., 1] == Color[1]) & (Pixels[..., 0] == Color[2])
 
+    @staticmethod
+    def NearColorMask(Pixels, Color, Tolerance):
+        Diff = np.abs(Pixels[..., :3].astype(np.int16) - np.array(Color[::-1], dtype=np.int16))
+        return np.all(Diff <= Tolerance, axis=-1)
+
+    @staticmethod
+    def Groups(Rows, MaxGap):
+        Breaks = np.where(np.diff(Rows) > MaxGap)[0] + 1
+        return np.split(Rows, Breaks)
+
+    @classmethod
+    def LocateBar(cls, Image, PrevWhiteY=None, GapMultiplier=2.0):
+        # Returns (Reading, None) or (None, FailureReason). Reading holds the fish line (white) and catch zone
+        # (dark gray) centres within the blue bar column
+        BlueMask = cls.ColorMask(Image, (85, 170, 255))
+        BlueCols = BlueMask.sum(axis=0)
+        # Averaging every blue pixel let stray blue (water, effects) drag the column off the bar,
+        # so centre on the columns that hold most of the bar's blue instead
+        if BlueCols.max() < 10:
+            return None, 'no_blue_bar'
+        Strong = np.where(BlueCols >= BlueCols.max() * 0.5)[0]
+        CenterX = int((Strong[0] + Strong[-1]) // 2)
+
+        # A few columns around the centre so a thin line landing between pixels is still seen
+        Band = Image[:, max(CenterX - 2, 0):CenterX + 3, :]
+        IsGray = cls.NearColorMask(Band, (25, 25, 25), 4).any(axis=1)
+        IsBlue = cls.ColorMask(Band, (85, 170, 255)).any(axis=1)
+        IsWhite = (Band[..., :3].min(axis=-1) >= 235).any(axis=1)
+
+        # The bar is the contiguous blue/gray/white run holding the most blue; this drops dark UI below the bar
+        # (the item count boxes) that would otherwise be read as catch zone
+        Runs = cls.Groups(np.where(IsGray | IsBlue | IsWhite)[0], 3)
+        Bar = max(Runs, key=lambda R: IsBlue[R].sum())
+        Top, Bottom = int(Bar[0]), int(Bar[-1])
+        GrayRows = Bar[IsGray[Bar]]
+        if len(GrayRows) == 0:
+            return None, 'no_gray'
+
+        # Search the whole bar, not just the catch zone: the fish line leaving the zone is exactly when it matters
+        WhiteRows = Bar[IsWhite[Bar]]
+        if len(WhiteRows) == 0:
+            return None, 'no_white'
+
+        # The fish line is ~3px thick; prefer it over 1px UI dividers that cross the bar
+        WhiteGroups = cls.Groups(WhiteRows, 2)
+        Thick = [G for G in WhiteGroups if len(G) >= 2] or WhiteGroups
+        if PrevWhiteY is not None:
+            White = min(Thick, key=lambda G: abs((G[0] + G[-1]) / 2 - PrevWhiteY))
+        else:
+            White = max(Thick, key=len)
+        WhiteHeight = White[-1] - White[0] + 1
+        WhiteCenter = int((White[0] + White[-1]) // 2)
+
+        # Split the catch zone into contiguous groups and follow the largest
+        ZoneGroups = cls.Groups(GrayRows, max(WhiteHeight * GapMultiplier, 3))
+        Zone = max(ZoneGroups, key=len)
+        TargetCenter = int((Zone[0] + Zone[-1]) // 2)
+
+        return {
+            'CenterX': CenterX, 'WhiteCenter': WhiteCenter, 'WhiteHeight': WhiteHeight,
+            'TargetCenter': TargetCenter, 'Groups': len(ZoneGroups), 'Top': int(Top), 'Bottom': int(Bottom)
+        }, None
+
     def SetMouse(self, Hold, Now):
         if Hold and not self.State.MousePressed:
             pyautogui.mouseDown()
@@ -1945,49 +2022,39 @@ class FishingMinigameController:
             time.sleep(0.2)
             return True
 
-        BlueMask = self.ColorMask(Image, (85, 170, 255))
-        if not np.any(BlueMask):
+        Reading, Failure = self.LocateBar(Image, self.PrevWhiteY,
+                                          self.Config.Settings['FishingControl']['Detection']['GapToleranceMultiplier'])
+
+        if Failure == 'no_blue_bar':
             self.Snapshot(Image, 'no_blue_bar')
             Still = self.BarMissing(Now)
             LogLine(f"MINIGAME blue bar not visible ({'waiting' if Still else 'ending minigame'})")
             return Still
         self.BarMissingSince = None
 
-        # Re-locate the bar column every frame so a shifted bar is still read correctly
-        CenterX = int(np.mean(np.where(BlueMask)[1]))
-        Column = Image[:, CenterX, :]
-
-        GrayY = np.where(self.ColorMask(Column, (25, 25, 25)))[0]
-        if len(GrayY) == 0:
+        if Failure == 'no_gray':
             self.Snapshot(Image, 'no_gray')
-            self.Trace(Now, f"no gray in column x={CenterX} -> keep state")
+            self.Trace(Now, "no catch zone in bar -> keep state")
+            self.SetMouse(self.State.MousePressed, Now)
             return True
 
-        TopBound = GrayY[0]
-        Bounded = Column[TopBound:GrayY[-1] + 1]
-
-        WhiteY = np.where(self.ColorMask(Bounded, (255, 255, 255)))[0]
-        if len(WhiteY) == 0:
+        if Failure == 'no_white':
+            # Fish line hidden (e.g. under the HOLD CLICK prompt): steer by where it was last seen
+            # instead of holding blindly, which drove the zone to the top when the fish was below it
             self.Snapshot(Image, 'no_white')
-            self.Trace(Now, f"no white in column x={CenterX} -> hold")
-            self.SetMouse(True, Now)
+            if self.PrevWhiteY is None or self.PrevTargetY is None:
+                self.Trace(Now, "no fish line -> keep state")
+                self.SetMouse(self.State.MousePressed, Now)
+            else:
+                ShouldHold = self.PrevWhiteY < self.PrevTargetY
+                self.Trace(Now, f"no fish line -> last seen {'above' if ShouldHold else 'below'} zone, hold={ShouldHold}")
+                self.SetMouse(ShouldHold, Now)
             return True
 
-        WhiteHeight = WhiteY[-1] - WhiteY[0] + 1
-        WhiteCenter = TopBound + (WhiteY[0] + WhiteY[-1]) // 2
-
-        DarkGrayY = np.where(self.ColorMask(Bounded, (25, 25, 25)))[0]
-        if len(DarkGrayY) == 0:
-            self.Snapshot(Image, 'no_target')
-            self.Trace(Now, "no target line -> hold")
-            self.SetMouse(True, Now)
-            return True
-
-        # Split the target line into contiguous groups and follow the largest
-        MaxGap = WhiteHeight * self.Config.Settings['FishingControl']['Detection']['GapToleranceMultiplier']
-        Breaks = np.where(np.diff(DarkGrayY) > MaxGap)[0] + 1
-        Largest = max(np.split(DarkGrayY, Breaks), key=len)
-        TargetCenter = TopBound + (Largest[0] + Largest[-1]) // 2
+        CenterX = Reading['CenterX']
+        WhiteHeight = Reading['WhiteHeight']
+        WhiteCenter = Reading['WhiteCenter']
+        TargetCenter = Reading['TargetCenter']
 
         Pd = self.Config.Settings['FishingControl']['PdController']
 
@@ -2021,7 +2088,7 @@ class FishingMinigameController:
 
         self.Trace(Now, f"x={CenterX} white={WhiteCenter} target={TargetCenter} err={Error} "
                         f"vW={self.WhiteVel:.0f} vT={self.TargetVel:.0f} pred={Predicted:.1f} hold={ShouldHold} "
-                        f"groups={len(Breaks) + 1} bounds={TopBound}-{GrayY[-1]}")
+                        f"groups={Reading['Groups']} bounds={Reading['Top']}-{Reading['Bottom']}")
 
         self.State.PreviousError = Error
         self.State.PreviousTargetY = TargetCenter
@@ -2269,13 +2336,14 @@ class AutomatedFishingSystem:
         S = int(Elapsed % 60)
         
         OverallFPH = self.State.GetFishPerHour()
-        
+        RarityBreakdown = ", ".join(f"{R}: {C}" for R, C in self.State.DevilFruitsByRarity.items() if C)
+
         self.Notifier.SendNotification(
             f"Stats (last {LogOpts['PeriodicStatsIntervalMinutes']}m)\n"
             f"Caught: {FishThisInterval} ({FishPerMin:.1f}/min)\n"
             f"Total: {self.State.TotalFishCaught} | Uptime: {H}:{M:02d}:{S:02d}\n"
             f"Rate: {OverallFPH:.1f}/hr | Timeouts: {self.State.TotalRecastTimeouts}\n"
-            f"Devil Fruits: {self.State.TotalDevilFruits}"
+            f"Devil Fruits: {self.State.TotalDevilFruits}" + (f" ({RarityBreakdown})" if RarityBreakdown else "")
         )
         
         self.State.LastPeriodicStatsTime = time.time()
@@ -2425,6 +2493,7 @@ class AutomatedFishingSystem:
                 if self.State.IsRunning:
                     self.State.UpdateStatus("Fish caught successfully!")
                     self.State.IncrementFishCount()
+                    threading.Thread(target=self.ScanForCaughtFruit, daemon=True).start()
                     self.State.UpdateStatus(f"Total fish: {self.State.TotalFishCaught}")
                     self.CheckPeriodicStats()
                     
@@ -2504,24 +2573,6 @@ class AutomatedFishingSystem:
         if not self.State.IsRunning:
             return False
         
-        if self.Config.Settings['AutomationFeatures']['AutoSelectTopBait'] and self.Config.Settings['AutomationFeatures']['SmartBaitSelect']:
-            self.ExecuteSmartBaitSelect(ForcePreCast)
-
-        elif self.Config.Settings['AutomationFeatures']['AutoSelectTopBait']:
-            Points = self.Config.Settings['ClickPoints']
-            if not Points['Bait']:
-                return False
-
-            LoopsPerTopBait = self.Config.Settings['AutomationFrequencies'].get('LoopsPerTopBait', 1)
-            if ForcePreCast or self.State.TopBaitCounter == 0 or self.State.TopBaitCounter >= LoopsPerTopBait:
-                self.ExecuteSelectTopBait()
-                self.State.TopBaitCounter = 1
-            else:
-                self.State.TopBaitCounter += 1
-
-        if not self.State.IsRunning:
-            return False
-        
         if self.Config.Settings['AutomationFeatures']['AutoCraftBait']:
             Points = self.Config.Settings['ClickPoints']
             if all([Points['CraftLeft'], Points['CraftMiddle'], Points['CraftButton'], Points['CloseMenu'], Points['AddRecipe'], Points['TopRecipe'], len(self.Config.Settings['BaitRecipes']) > 0]):
@@ -2592,6 +2643,25 @@ class AutomatedFishingSystem:
                 self.ExecutePotionBrew()
                 if not self.State.IsRunning:
                     return False
+
+        # Bait goes last: the shop, fruit storage and selling all swap items, which undid an earlier pick
+        if self.Config.Settings['AutomationFeatures']['AutoSelectTopBait'] and self.Config.Settings['AutomationFeatures']['SmartBaitSelect']:
+            self.ExecuteSmartBaitSelect(ForcePreCast)
+
+        elif self.Config.Settings['AutomationFeatures']['AutoSelectTopBait']:
+            Points = self.Config.Settings['ClickPoints']
+            if not Points['Bait']:
+                return False
+
+            LoopsPerTopBait = self.Config.Settings['AutomationFrequencies'].get('LoopsPerTopBait', 1)
+            if ForcePreCast or self.State.TopBaitCounter == 0 or self.State.TopBaitCounter >= LoopsPerTopBait:
+                self.ExecuteSelectTopBait()
+                self.State.TopBaitCounter = 1
+            else:
+                self.State.TopBaitCounter += 1
+
+        if not self.State.IsRunning:
+            return False
 
         self.State.UpdateStatus("Pre-cast complete")
         return True
@@ -2756,6 +2826,63 @@ class AutomatedFishingSystem:
         
         self.State.UpdateStatus("Bait purchased successfully")
     
+    def ScanForCaughtFruit(self):
+        # Runs off the fishing thread after each catch: watch the "New Item" popup for a devil fruit
+        if not self.OcrManager.Enabled:
+            return
+        CatchNumber = self.State.TotalFishCaught
+        # OCR runs on CPU without CUDA (~1-3s per read), so allow a few reads for the popup to appear
+        Deadline = time.time() + 7.0
+        Attempt = 0
+        while time.time() < Deadline and self.State.IsRunning:
+            FruitName = self.FruitDetector.DetectNewItem()
+            Attempt += 1
+            LogLine(f"FRUIT scan catch#{CatchNumber} try{Attempt}: {self.FruitDetector.LastRawText!r} -> {FruitName}")
+            if Attempt == 1:
+                self.SaveFruitScanDebug(CatchNumber)
+            if FruitName:
+                # The popup can outlive one catch; skip a re-read of the same notification
+                if time.time() - self.State.LastCaughtFruitTime < 8:
+                    return
+                self.State.LastCaughtFruitTime = time.time()
+                Rarity = self.State.IncrementDevilFruitCount(FruitName)
+                self.State.FruitsCountedBeforeStore.append((FruitName, Rarity))
+                LogLine(f"FRUIT caught {FruitName} ({Rarity})")
+                self.Notifier.SendNotification(f"Devil Fruit {FruitName} ({Rarity}) caught!")
+                return
+            time.sleep(0.5)
+
+    def SaveFruitScanDebug(self, CatchNumber, Keep=20):
+        # Save the full screen, the scanned region and the OCR text right after a catch,
+        # so a missed fruit popup can be located and the Fruit Detection Area corrected
+        try:
+            DebugDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FruitScanDebug")
+            os.makedirs(DebugDir, exist_ok=True)
+            Base = os.path.join(DebugDir, f"catch_{CatchNumber:05d}")
+            with mss.mss() as ScreenCapture:
+                Shot = ScreenCapture.grab(ScreenCapture.monitors[1])
+            Full = PILImage.frombytes('RGB', Shot.size, Shot.rgb)
+            Full.thumbnail((Full.width // 2, Full.height // 2))
+            Full.save(Base + "_screen.jpg", quality=80)
+            if self.FruitDetector.LastScanImage is not None:
+                PILImage.fromarray(self.FruitDetector.LastScanImage).save(Base + "_region.png")
+            with open(Base + "_ocr.txt", "w", encoding="utf-8") as F:
+                F.write(f"region={self.Config.Settings['OCRSettings']}\ntext={self.FruitDetector.LastRawText!r}\n")
+            Catches = sorted({N.split("_")[1] for N in os.listdir(DebugDir) if N.startswith("catch_")})
+            for Old in Catches[:-Keep]:
+                for N in os.listdir(DebugDir):
+                    if N.startswith(f"catch_{Old}_"):
+                        os.remove(os.path.join(DebugDir, N))
+        except Exception as E:
+            print(f"Fruit scan debug save failed: {E}")
+
+    def CountStoredFruit(self):
+        # Store-cycle fallback: only count fruits the catch-time scan missed
+        if self.State.FruitsCountedBeforeStore:
+            return self.State.FruitsCountedBeforeStore.pop(0)
+        FruitName = self.FruitDetector.IdentifyStoredFruit()
+        return FruitName or "Unknown", self.State.IncrementDevilFruitCount(FruitName)
+
     def ExecuteFruitStorage(self):
         self.State.UpdateStatus("Storing Devil Fruit")
         
@@ -2811,22 +2938,13 @@ class AutomatedFishingSystem:
 
                     time.sleep(self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitClickDelay'] + 0.5)
 
-                    if self.Config.Settings['DevilFruitStorage']['WebhookUrl']:
-                        if InitGreen and not ColorDetector.DetectGreenish(Points['StoreFruit']):
-                            DetectedFruit = None
-                            if self.OcrManager.Enabled:
-                                RawDetection = self.FruitDetector.DetectNewItem()
-                                if RawDetection:
-                                    ClosestMatch = self.FruitDetector.GetClosestFruit(RawDetection, Cutoff=0.6)
-                                    if ClosestMatch:
-                                        DetectedFruit = ClosestMatch
-                            FruitName = DetectedFruit or "Unknown"
-                            self.State.UpdateStatus(f"Fruit stored (slot {Slot})")
-                            self.State.IncrementDevilFruitCount()
-                            self.Notifier.SendNotification(f"Devil Fruit {FruitName} stored successfully! (Slot {Slot})")
-                        else:
-                            self.State.UpdateStatus(f"Fruit storage failed (slot {Slot})")
-                            self.Notifier.SendNotification(f"Devil Fruit could not be stored. (Slot {Slot})")
+                    if InitGreen and not ColorDetector.DetectGreenish(Points['StoreFruit']):
+                        FruitName, Rarity = self.CountStoredFruit()
+                        self.State.UpdateStatus(f"Fruit stored (slot {Slot})")
+                        self.Notifier.SendNotification(f"Devil Fruit {FruitName} ({Rarity}) stored successfully! (Slot {Slot})")
+                    elif InitGreen:
+                        self.State.UpdateStatus(f"Fruit storage failed (slot {Slot})")
+                        self.Notifier.SendNotification(f"Devil Fruit could not be stored. (Slot {Slot})")
                             
             keyboard.press_and_release('`')
 
@@ -2858,28 +2976,13 @@ class AutomatedFishingSystem:
                 
                 if InitGreen:
                     time.sleep(self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitClickDelay'] + 0.5)
-                    if self.Config.Settings['DevilFruitStorage']['WebhookUrl'] and not ColorDetector.DetectGreenish(Points['StoreFruit']):
-                        DetectedFruit = None
-                        if self.OcrManager.Enabled:
-                            RawDetection = self.FruitDetector.DetectNewItem()
-                            if RawDetection:
-                                ClosestMatch = self.FruitDetector.GetClosestFruit(RawDetection, Cutoff=0.6)
-                                if ClosestMatch:
-                                    DetectedFruit = ClosestMatch
-
-                        if DetectedFruit:
-                            self.State.UpdateStatus("Fruit stored successfully")
-                            self.State.IncrementDevilFruitCount()
-                            self.Notifier.SendNotification(f"Devil Fruit {DetectedFruit} stored successfully!")
-                        else:
-                            self.State.UpdateStatus("Fruit stored successfully")
-                            self.State.IncrementDevilFruitCount()
-                            self.Notifier.SendNotification("Devil Fruit stored successfully!")
+                    if not ColorDetector.DetectGreenish(Points['StoreFruit']):
+                        FruitName, Rarity = self.CountStoredFruit()
+                        self.State.UpdateStatus("Fruit stored successfully")
+                        self.Notifier.SendNotification(f"Devil Fruit {FruitName} ({Rarity}) stored successfully!")
                     else:
-                        if self.Config.Settings['DevilFruitStorage']['WebhookUrl']:
-                            self.State.UpdateStatus("Fruit storage failed")
-                            self.State.IncrementDevilFruitCount()
-                            self.Notifier.SendNotification("Devil Fruit could not be stored.")
+                        self.State.UpdateStatus("Fruit storage failed")
+                        self.Notifier.SendNotification("Devil Fruit could not be stored.")
 
                         if self.Config.Settings['AutomationFeatures']['AutoBuyBait']:
                             keyboard.press_and_release('shift')
@@ -2979,6 +3082,14 @@ class AutomatedFishingSystem:
 
         if not (ForcePreCast or self.State.BaitRescanNeeded or OutOfBait or CountUnknown):
             self.State.TopBaitCounter += 1
+            # Something swapped items since the last pick; re-equipping can fall back to another bait, so click it again
+            if not self.State.RodEquipped and self.State.SelectedBaitPoint:
+                self.EquipRod()
+                if not self.State.IsRunning:
+                    return False
+                self.State.UpdateStatus(f"Re-selecting {self.State.SelectedBait}")
+                self.InputController.ClickPoint(self.State.SelectedBaitPoint)
+                time.sleep(self.Config.Settings['TimingDelays']['Inventory']['AutoSelectBaitDelay'])
             return True
 
         self.EquipRod()
@@ -3015,6 +3126,7 @@ class AutomatedFishingSystem:
                 self.State.UpdateStatus("No bait left in stock")
                 self.NotifyBaitChange(f"Ran out of {self.State.SelectedBait} and no other bait was detected.")
                 self.State.SelectedBait = None
+            self.State.SelectedBaitPoint = None
             # OCR unavailable or nothing read: behave like the plain top bait selector
             if self.Config.Settings['ClickPoints']['Bait']:
                 return self.ExecuteSelectTopBait()
@@ -3028,6 +3140,7 @@ class AutomatedFishingSystem:
 
         self.State.SelectedBait = Best['Name']
         self.State.BaitRemaining = Best['Count']
+        self.State.SelectedBaitPoint = Best['Point']
 
         if Previous and Previous != Best['Name']:
             Reason = f" (couldn't buy {TierOrder[0]} - out of money?)" if PurchaseFailed else ""
@@ -3260,6 +3373,8 @@ class AutomatedFishingSystem:
             "isRunning": self.State.IsRunning,
             "fishCaught": self.State.TotalFishCaught,
             "devilFruitsCaught": self.State.TotalDevilFruits,
+            "devilFruitsByRarity": self.State.DevilFruitsByRarity,
+            "lastDevilFruit": self.State.LastDevilFruit,
             "timeElapsed": self.State.GetFormattedElapsedTime(),
             "moveDuration": self.Config.Settings['TimingDelays']['Crafting']['MoveDuration'],
             "fishPerHour": round(self.State.GetFishPerHour(), 1),
@@ -4063,6 +4178,7 @@ def HandleClearCache():
         MacroSystem.State.BaitRescanNeeded = True
 
         MacroSystem.State.TotalFishCaught = 0
+        MacroSystem.State.ResetDevilFruitCounts()
         MacroSystem.State.CumulativeUptime = 0
         MacroSystem.State.SessionStartTime = time.time() if MacroSystem.State.IsRunning else None
         MacroSystem.State.LastPeriodicStatsTime = time.time()
