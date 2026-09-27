@@ -364,6 +364,13 @@
               <button class="btn-sm" onclick="sendToPython('set_bait_point','')">Set</button>
             </div>
           </div>
+          <div class="row-item">
+            <span class="row-label">Bait List Region</span>
+            <div class="row-ctrl">
+              <button class="btn-sm" onclick="sendToPython('open_bait_region_selector','')">Configure Region</button>
+            </div>
+          </div>
+          <div class="row-hint">Bait List Region is used by Smart Tier Selection — cover the "Fishing Baits" panel shown while the rod is equipped</div>
         </div>
 
         <div class="section-title">Bait Shop Dialog</div>
@@ -518,6 +525,27 @@
                 <span class="unit">loops</span>
               </div>
             </div>
+            <div class="row-item">
+              <span class="row-label">Smart Tier Selection</span>
+              <div class="row-ctrl">
+                <div class="toggle" id="smartBaitSelectToggle" onclick="toggleSetting('smartBaitSelect')"></div>
+              </div>
+            </div>
+            <div class="row-item">
+              <span class="row-label">Tier order (best first)</span>
+              <div class="row-ctrl">
+                <input type="text" class="inp inp-wide" id="baitTierOrder"
+                  onchange="sendToPython('set_bait_tier_order', this.value)">
+              </div>
+            </div>
+            <div class="row-item">
+              <span class="row-label">Current bait</span>
+              <div class="row-ctrl">
+                <span class="point-badge unset" id="selectedBaitStatus">None</span>
+                <button class="btn-sm" onclick="testBaitScan()">Test Scan</button>
+              </div>
+            </div>
+            <div class="row-hint">Smart mode uses the first bait in the list while it's in stock. When it runs out, Auto Buy tries to restock it first; only if that fails (e.g. out of money) does it fall back to the next tier as insurance, and it switches back once the first bait can be bought again. The loop interval above only applies when the bait count can't be read.</div>
           </div>
         </div>
 

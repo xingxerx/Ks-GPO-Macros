@@ -86,7 +86,7 @@ fn ShouldSkipDir(Name: &str) -> bool {
     SKIP_DIRS.iter().any(|S| Lower == S.to_lowercase())
 }
 
-fn ShouldSkipFile(Name: &str, Extension: Option<&str>) -> bool {
+fn ShouldSkipFile(_Name: &str, Extension: Option<&str>) -> bool {
     if let Some(Ext) = Extension {
         if SKIP_EXTENSIONS.iter().any(|S| Ext.eq_ignore_ascii_case(S)) {
             return true;

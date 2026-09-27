@@ -202,7 +202,9 @@ function checkRequirements(name) {
         });
     }
     if (name === 'autoSelectBait') {
-        if (document.getElementById('baitPointStatus')?.classList.contains('unset')) missing = true;
+        // Smart mode finds bait by OCR, so the Top Bait Point is only an optional fallback
+        const smart = document.getElementById('smartBaitSelectToggle')?.classList.contains('active');
+        if (!smart && document.getElementById('baitPointStatus')?.classList.contains('unset')) missing = true;
     }
     if (name === 'autoSellFish') {
         ['sellLeftPointStatus', 'sellMiddlePointStatus', 'sellAcceptPointStatus', 'sellClosePointStatus'].forEach(id => {
@@ -479,7 +481,7 @@ function toggleSetting(settingName) {
     const isActive = toggle.classList.contains('active');
     sendToPython(`toggle_${settingName.replace(/([A-Z])/g, '_$1').toLowerCase()}`, isActive.toString());
 
-    if (setting === 'storeToBackpack') {
+    if (settingName === 'storeToBackpack') {
         renderBackpackLocationRows(window.currentDevilFruitHotkeys || [], window.currentBackpackLocations || []);
     }
 
@@ -604,6 +606,32 @@ async function testWebhook() {
     } catch (e) { showErrorNotification('Failed to send test webhook.'); }
 }
 
+function updateSmartBait(state) {
+    if (state.smartBaitSelect !== undefined) setToggleState('smartBaitSelectToggle', state.smartBaitSelect);
+    if (state.baitTierOrder) setInputValue('baitTierOrder', state.baitTierOrder.join(', '));
+    const el = document.getElementById('selectedBaitStatus');
+    if (!el) return;
+    if (state.selectedBait) {
+        el.textContent = state.baitRemaining != null ? `${state.selectedBait} (${Math.max(state.baitRemaining, 0)} left)` : state.selectedBait;
+        el.className = 'point-badge set';
+    } else {
+        el.textContent = 'None';
+        el.className = 'point-badge unset';
+    }
+}
+
+async function testBaitScan() {
+    showToast('Scanning bait list — equip your rod so the list is visible', 'warn');
+    const result = await sendToPython('test_bait_scan', '');
+    if (result?.status !== 'success') return;
+    if (!result.baits.length) {
+        showErrorNotification('No bait found. Check the Bait List Region in Locations → Bait.');
+        return;
+    }
+    const found = result.baits.map(b => b.count != null ? `${b.name} x${b.count}` : b.name).join(', ');
+    showToast(`Found (best first): ${found}`, 'warn');
+}
+
 function renderRecipes(recipes) {
     const container = document.getElementById('RecipesContainer');
     if (!container) return;
@@ -720,6 +748,7 @@ function loadAllSettings(state) {
     setExpandableSection('autoStoreFruitToggle', 'autoStoreExpand', state.autoStoreDevilFruit);
     setExpandableSection('autoUsePotionBrewToggle', 'autoPotionBrewExpand', state.autoUsePotionBrew || false);
     setExpandableSection('autoSelectBaitToggle', 'autoSelectBaitExpand', state.autoSelectTopBait);
+    updateSmartBait(state);
     setToggleState('storeToBackpackToggle', state.storeToBackpack);
 
     setExpandableSection('autoSellFishToggle', 'autoSellExpand', state.autoSellFish || false);
@@ -915,6 +944,7 @@ async function pollPythonState() {
         });
 
         if (state.baitRecipes !== undefined) renderRecipes(state.baitRecipes);
+        updateSmartBait(state);
 
         checkRequirements('autoStoreFruit');
         checkRequirements('autoBuyBait');

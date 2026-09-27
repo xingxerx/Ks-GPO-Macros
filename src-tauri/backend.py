@@ -158,6 +158,7 @@ class ConfigurationManager:
                 'AutoUsePotionBrew': False,
                 'AutoStoreFruit': False,
                 'AutoSelectTopBait': False,
+                'SmartBaitSelect': False,
                 'AutoSellFish': False,
             },
             'AutomationFrequencies': {
@@ -286,6 +287,17 @@ class ConfigurationManager:
                 'X2': int(MonitorWidth * 0.60),
                 'Y2': int(MonitorHeight * 0.20)
             },
+            'BaitSelector': {
+                # Preferred bait first. The first tier is the one Auto Buy restocks; later tiers are
+                # insurance, only used once it runs out and a purchase fails (e.g. out of money)
+                'TierOrder': ['Common Fish Bait', 'Rare Fish Bait', 'Legendary Fish Bait'],
+                'Region': {
+                    'X1': int(MonitorWidth * 0.40),
+                    'Y1': int(MonitorHeight * 0.67),
+                    'X2': int(MonitorWidth * 0.60),
+                    'Y2': int(MonitorHeight * 0.84)
+                }
+            },
             'BaitRecipes': [],
             'CurrentRecipeIndex': 0
         }
@@ -387,6 +399,7 @@ class ConfigurationManager:
             self.Settings['AutomationFeatures']['AutoCraftBait'] = Auto.get("AutoCraftBait", False)
             self.Settings['AutomationFeatures']['AutoStoreFruit'] = Auto.get("AutoStoreDevilFruit", False)
             self.Settings['AutomationFeatures']['AutoSelectTopBait'] = Auto.get("AutoSelectTopBait", False)
+            self.Settings['AutomationFeatures']['SmartBaitSelect'] = Auto.get("SmartBaitSelect", False)
             self.Settings['AutomationFeatures']['AutoSellFish'] = Auto.get("AutoSellFish", False)
             self.Settings['AutomationFeatures']['AutoUsePotionBrew'] = Auto.get("AutoUsePotionBrew", False)
         
@@ -477,6 +490,13 @@ class ConfigurationManager:
         
         if "OCRSettings" in LoadedData:
             self.Settings['OCRSettings'].update(LoadedData["OCRSettings"])
+
+        if "BaitSelector" in LoadedData:
+            Selector = LoadedData["BaitSelector"]
+            if Selector.get("TierOrder"):
+                self.Settings['BaitSelector']['TierOrder'] = Selector["TierOrder"]
+            if "Region" in Selector:
+                self.Settings['BaitSelector']['Region'].update(Selector["Region"])
     
     def SaveToDisk(self):
         try:
@@ -523,6 +543,7 @@ class ConfigurationManager:
                     "AutoBuyCommonBait": self.Settings['AutomationFeatures']['AutoBuyBait'],
                     "AutoStoreDevilFruit": self.Settings['AutomationFeatures']['AutoStoreFruit'],
                     "AutoSelectTopBait": self.Settings['AutomationFeatures']['AutoSelectTopBait'],
+                    "SmartBaitSelect": self.Settings['AutomationFeatures']['SmartBaitSelect'],
                     "AutoUsePotionBrew": self.Settings['AutomationFeatures']['AutoUsePotionBrew'],
                     "AutoCraftBait": self.Settings['AutomationFeatures']['AutoCraftBait'],
                     "AutoSellFish": self.Settings['AutomationFeatures']['AutoSellFish'],
@@ -537,6 +558,7 @@ class ConfigurationManager:
                 "TimingDelays": self.Settings['TimingDelays'],
                 "SpawnDetection": self.Settings['SpawnDetection'],
                 "OCRSettings": self.Settings['OCRSettings'],
+                "BaitSelector": self.Settings['BaitSelector'],
             }
             
             with open(self.ConfigPath, 'w') as ConfigFile:
@@ -571,6 +593,12 @@ class MacroStateManager:
         self.BaitCraftCounter = 0
         self.TopBaitCounter = 0
         self.SellCounter = 0
+
+        # Smart bait tracking: remaining is decremented per cast and triggers a rescan at zero
+        self.SelectedBait = None
+        self.BaitRemaining = None
+        self.BaitRescanNeeded = True
+        self.LastBaitPurchaseTime = 0
         
         self.RobloxWindowFocused = False
         self.FastModeEnabled = False
@@ -676,7 +704,9 @@ class OCRManager:
     def __init__(self):
         self.Reader = None
         self.Enabled = True
-    
+        # Spawn detection runs on its own thread, so serialize readtext calls on the shared reader
+        self.Lock = Lock()
+
     def Initialize(self):
         if self.Reader is None and self.Enabled:
             try:
@@ -881,6 +911,117 @@ class DevilFruitDetector:
 
         Matches = get_close_matches(Name, KnownFruits, n=1, cutoff=Cutoff)
         return Matches[0] if Matches else None
+
+
+class BaitListReader:
+    # Reads the "Fishing Baits" panel shown while the rod is equipped, e.g. "Rare Fish Bait X1"
+
+    Scale = 2
+    CountPattern = re.compile(r'[xX×*]\s*([0-9OoIlSs]+)\s*$')
+
+    def __init__(self, OcrManager, Config):
+        self.OcrManager = OcrManager
+        self.Config = Config
+
+    @staticmethod
+    def ParseCount(Raw):
+        Digits = Raw.translate(str.maketrans('OoIlSs', '001155'))
+        return int(Digits) if Digits.isdigit() else None
+
+    def MatchTier(self, Name, TierOrder):
+        Lowered = [T.lower() for T in TierOrder]
+        Matches = get_close_matches(Name.lower(), Lowered, n=1, cutoff=0.75)
+        return Lowered.index(Matches[0]) if Matches else None
+
+    def ScanBaits(self):
+        # Returns in-stock baits best tier first: [{Name, Tier, Count, Point}]; None when OCR is unavailable
+        try:
+            if self.OcrManager.Reader is None:
+                if not self.OcrManager.Enabled:
+                    return None
+                self.OcrManager.Initialize()
+                if not self.OcrManager.WaitForInitialization():
+                    return None
+
+            Region = self.Config.Settings['BaitSelector']['Region']
+            ScanRegion = {
+                "top": Region['Y1'],
+                "left": Region['X1'],
+                "width": Region['X2'] - Region['X1'],
+                "height": Region['Y2'] - Region['Y1']
+            }
+
+            with mss.mss() as ScreenCapture:
+                Image = np.array(ScreenCapture.grab(ScanRegion))
+
+            # Bait names mix white and coloured text, so OCR the upscaled grayscale instead of a white threshold
+            Gray = cv2.cvtColor(Image, cv2.COLOR_BGRA2GRAY)
+            Gray = cv2.resize(Gray, None, fx=self.Scale, fy=self.Scale, interpolation=cv2.INTER_CUBIC)
+
+            with self.OcrManager.Lock:
+                Results = self.OcrManager.Reader.readtext(Gray, detail=1, paragraph=False, text_threshold=0.5)
+
+            Boxes = []
+            for Bbox, Text, Conf in Results:
+                if Conf < 0.3 or not Text.strip():
+                    continue
+                Xs = [P[0] for P in Bbox]
+                Ys = [P[1] for P in Bbox]
+                Boxes.append({'Text': Text.strip(), 'X0': min(Xs), 'X1': max(Xs), 'Cy': (min(Ys) + max(Ys)) / 2, 'H': max(Ys) - min(Ys)})
+
+            # Name and count are often separate boxes, so merge boxes sharing a line
+            Rows = []
+            for Box in sorted(Boxes, key=lambda B: B['Cy']):
+                if Rows and abs(Box['Cy'] - Rows[-1][-1]['Cy']) < max(Box['H'], Rows[-1][-1]['H']) * 0.6:
+                    Rows[-1].append(Box)
+                else:
+                    Rows.append([Box])
+
+            TierOrder = self.Config.Settings['BaitSelector']['TierOrder']
+            Baits = []
+            for RowIndex, Row in enumerate(Rows):
+                Row.sort(key=lambda B: B['X0'])
+                Text = " ".join(B['Text'] for B in Row)
+                CountMatch = self.CountPattern.search(Text)
+                Count = self.ParseCount(CountMatch.group(1)) if CountMatch else None
+                Name = (Text[:CountMatch.start()] if CountMatch else Text).strip()
+                Lower = Name.lower()
+
+                # Skip the "Fishing Baits" header and the "Craft more bait types" footer before fuzzy matching,
+                # since the header is close enough to match a real bait name
+                if 'baits' in Lower or 'craft' in Lower or 'smith' in Lower:
+                    continue
+
+                Tier = self.MatchTier(Name, TierOrder)
+                if Tier is None:
+                    if 'bait' not in Lower:
+                        continue
+                    # Unlisted baits rank below every listed tier, keeping on-screen order
+                    Tier = len(TierOrder) + RowIndex
+                else:
+                    Name = TierOrder[Tier]
+
+                if Count == 0:
+                    continue
+
+                Baits.append({
+                    'Name': Name,
+                    'Tier': Tier,
+                    'Count': Count,
+                    'Point': {
+                        'x': int(Region['X1'] + (Row[0]['X0'] + Row[-1]['X1']) / 2 / self.Scale),
+                        'y': int(Region['Y1'] + sum(B['Cy'] for B in Row) / len(Row) / self.Scale)
+                    }
+                })
+
+            Baits.sort(key=lambda B: B['Tier'])
+            LogLine(f"Bait scan: {[(B['Name'], B['Count']) for B in Baits]}")
+            return Baits
+
+        except Exception as E:
+            print(f"Bait scan error: {E}")
+            traceback.print_exc()
+            return None
 
 
 class WebhookNotifier:
@@ -1935,6 +2076,7 @@ class AutomatedFishingSystem:
         
         self.OcrManager = OCRManager()
         self.FruitDetector = DevilFruitDetector(self.OcrManager, self.Config)
+        self.BaitReader = BaitListReader(self.OcrManager, self.Config)
         self.Notifier = WebhookNotifier(self.Config, self.State)
         self.SoundDetector = MegalodonSoundDetector(self.Config)
         self.InputController = InputController(self.Config)
@@ -2051,6 +2193,7 @@ class AutomatedFishingSystem:
             self.State.ClientStats[self.State.ClientId]["fish_caught"] = self.State.TotalFishCaught
             self.State.RobloxWindowFocused = False
             self.State.RodEquipped = False
+            self.State.BaitRescanNeeded = True
             self.State.ConsecutiveRecastTimeouts = 0
             self.State.LastPeriodicStatsTime = time.time()
             self.State.FishAtLastStats = self.State.TotalFishCaught
@@ -2209,7 +2352,11 @@ class AutomatedFishingSystem:
                 if not self.ExecuteCastSequence():
                     self.State.UpdateStatus("Cast failed - restarting cycle")
                     continue
-                
+
+                # Count down on cast rather than catch so a miscount rescans early instead of fishing baitless
+                if self.State.BaitRemaining is not None:
+                    self.State.BaitRemaining -= 1
+
                 self.State.UpdateStatus("Waiting for bobber to appear")
                 if not self.MinigameController.WaitForBobber():
                     self.State.UpdateStatus("Bobber timeout - recasting")
@@ -2357,11 +2504,14 @@ class AutomatedFishingSystem:
         if not self.State.IsRunning:
             return False
         
-        if self.Config.Settings['AutomationFeatures']['AutoSelectTopBait']:
+        if self.Config.Settings['AutomationFeatures']['AutoSelectTopBait'] and self.Config.Settings['AutomationFeatures']['SmartBaitSelect']:
+            self.ExecuteSmartBaitSelect(ForcePreCast)
+
+        elif self.Config.Settings['AutomationFeatures']['AutoSelectTopBait']:
             Points = self.Config.Settings['ClickPoints']
             if not Points['Bait']:
                 return False
-            
+
             LoopsPerTopBait = self.Config.Settings['AutomationFrequencies'].get('LoopsPerTopBait', 1)
             if ForcePreCast or self.State.TopBaitCounter == 0 or self.State.TopBaitCounter >= LoopsPerTopBait:
                 self.ExecuteSelectTopBait()
@@ -2377,6 +2527,8 @@ class AutomatedFishingSystem:
             if all([Points['CraftLeft'], Points['CraftMiddle'], Points['CraftButton'], Points['CloseMenu'], Points['AddRecipe'], Points['TopRecipe'], len(self.Config.Settings['BaitRecipes']) > 0]):
                 if ForcePreCast or self.State.FishSinceLastCraft >= self.Config.Settings['AutomationFrequencies']['FishCountPerCraft']:
                     self.ExecuteCraftingCycle()
+                    # Freshly crafted bait may outrank the current tier
+                    self.State.BaitRescanNeeded = True
                     if not self.State.IsRunning:
                         return False
         
@@ -2388,6 +2540,7 @@ class AutomatedFishingSystem:
             if Points['ShopLeft'] and Points['ShopCenter'] and Points['ShopRight']:
                 if ForcePreCast or self.State.BaitPurchaseCounter == 0 or self.State.BaitPurchaseCounter >= self.Config.Settings['AutomationFrequencies']['LoopsPerPurchase']:
                     self.ExecuteBaitPurchase()
+                    self.State.BaitRescanNeeded = True
                     if not self.State.IsRunning:
                         return False
                     self.State.BaitPurchaseCounter = 1
@@ -2560,6 +2713,7 @@ class AutomatedFishingSystem:
             self.Notifier.SendNotification("Crafting cycle complete.")
     
     def ExecuteBaitPurchase(self):
+        self.State.LastBaitPurchaseTime = time.time()
         self.State.UpdateStatus("Opening Shop")
         keyboard.press_and_release('e')
         time.sleep(self.Config.Settings['TimingDelays']['PreCast']['SetPrecastEDelay'])
@@ -2814,8 +2968,89 @@ class AutomatedFishingSystem:
         self.State.UpdateStatus("Selecting Top Bait")
         self.InputController.ClickPoint(Points['Bait'])
         time.sleep(self.Config.Settings['TimingDelays']['Inventory']['AutoSelectBaitDelay'])
-        
+
         return True
+
+    def ExecuteSmartBaitSelect(self, ForcePreCast=False):
+        LoopsPerTopBait = self.Config.Settings['AutomationFrequencies'].get('LoopsPerTopBait', 1)
+        OutOfBait = self.State.BaitRemaining is not None and self.State.BaitRemaining <= 0
+        # With a readable count the rescan waits for it to run out; otherwise fall back to the loop interval
+        CountUnknown = self.State.BaitRemaining is None and self.State.TopBaitCounter >= LoopsPerTopBait
+
+        if not (ForcePreCast or self.State.BaitRescanNeeded or OutOfBait or CountUnknown):
+            self.State.TopBaitCounter += 1
+            return True
+
+        self.EquipRod()
+        if not self.State.IsRunning:
+            return False
+
+        self.State.UpdateStatus("Scanning bait list")
+        Baits = self.BaitReader.ScanBaits()
+        self.State.TopBaitCounter = 1
+        self.State.BaitRescanNeeded = False
+
+        TierOrder = self.Config.Settings['BaitSelector']['TierOrder']
+        PurchaseFailed = False
+        if self.ShouldRestockPreferredBait(Baits):
+            # Preferred bait is gone: try buying more before touching the insurance tiers
+            self.State.UpdateStatus(f"Out of {TierOrder[0]} - buying more")
+            self.ExecuteBaitPurchase()
+            # Counts as this cycle's purchase so the regular Auto Buy doesn't immediately buy again
+            self.State.BaitPurchaseCounter = 1
+            if not self.State.IsRunning:
+                return False
+
+            self.EquipRod()
+            if not self.State.IsRunning:
+                return False
+
+            self.State.UpdateStatus("Rescanning bait list")
+            Baits = self.BaitReader.ScanBaits()
+            PurchaseFailed = bool(Baits) and Baits[0]['Tier'] != 0
+
+        if not Baits:
+            self.State.BaitRemaining = None
+            if Baits is not None and self.State.SelectedBait:
+                self.State.UpdateStatus("No bait left in stock")
+                self.NotifyBaitChange(f"Ran out of {self.State.SelectedBait} and no other bait was detected.")
+                self.State.SelectedBait = None
+            # OCR unavailable or nothing read: behave like the plain top bait selector
+            if self.Config.Settings['ClickPoints']['Bait']:
+                return self.ExecuteSelectTopBait()
+            return True
+
+        Best = Baits[0]
+        Previous = self.State.SelectedBait
+        self.State.UpdateStatus(f"Selecting {Best['Name']}" + (f" (x{Best['Count']})" if Best['Count'] is not None else ""))
+        self.InputController.ClickPoint(Best['Point'])
+        time.sleep(self.Config.Settings['TimingDelays']['Inventory']['AutoSelectBaitDelay'])
+
+        self.State.SelectedBait = Best['Name']
+        self.State.BaitRemaining = Best['Count']
+
+        if Previous and Previous != Best['Name']:
+            Reason = f" (couldn't buy {TierOrder[0]} - out of money?)" if PurchaseFailed else ""
+            self.NotifyBaitChange(f"Bait switched: {Previous} → {Best['Name']}" + (f" (x{Best['Count']})" if Best['Count'] is not None else "") + Reason)
+
+        return True
+
+    def ShouldRestockPreferredBait(self, Baits):
+        if Baits is None or (Baits and Baits[0]['Tier'] == 0):
+            return False
+        if not self.Config.Settings['AutomationFeatures']['AutoBuyBait']:
+            return False
+        Points = self.Config.Settings['ClickPoints']
+        if not (Points['ShopLeft'] and Points['ShopCenter'] and Points['ShopRight']):
+            return False
+        # A purchase that just happened and still left us without preferred bait means we are broke;
+        # wait for the regular purchase cycle instead of retrying every cast
+        return time.time() - self.State.LastBaitPurchaseTime > 60
+
+    def NotifyBaitChange(self, Message):
+        LogOpts = self.Config.Settings['LoggingOptions']
+        if self.Config.Settings['DevilFruitStorage']['WebhookUrl'] and LogOpts['LogGeneralUpdates']:
+            self.Notifier.SendNotification(Message)
 
     def ExecutePotionBrew(self):
         self.State.UpdateStatus("Starting Potion Brew Cycle")
@@ -3052,6 +3287,10 @@ class AutomatedFishingSystem:
             "autoBuyCommonBait": self.Config.Settings['AutomationFeatures']['AutoBuyBait'],
             "autoStoreDevilFruit": self.Config.Settings['AutomationFeatures']['AutoStoreFruit'],
             "autoSelectTopBait": self.Config.Settings['AutomationFeatures']['AutoSelectTopBait'],
+            "smartBaitSelect": self.Config.Settings['AutomationFeatures']['SmartBaitSelect'],
+            "baitTierOrder": self.Config.Settings['BaitSelector']['TierOrder'],
+            "selectedBait": self.State.SelectedBait,
+            "baitRemaining": self.State.BaitRemaining,
             "kp": self.Config.Settings['FishingControl']['PdController']['Kp'],
             "kd": self.Config.Settings['FishingControl']['PdController']['Kd'],
             "pdClamp": self.Config.Settings['FishingControl']['PdController']['PdClamp'],
@@ -3461,6 +3700,10 @@ def ProcessCommand():
             'toggle_auto_buy_bait': lambda: HandleBoolToggle('AutomationFeatures.AutoBuyBait'),
             'toggle_auto_store_fruit': lambda: HandleBoolToggle('AutomationFeatures.AutoStoreFruit'),
             'toggle_auto_select_bait': lambda: HandleBoolToggle('AutomationFeatures.AutoSelectTopBait'),
+            'toggle_smart_bait_select': lambda: HandleBoolToggle('AutomationFeatures.SmartBaitSelect'),
+            'set_bait_tier_order': lambda: HandleBaitTierOrder(Payload),
+            'test_bait_scan': lambda: HandleTestBaitScan(),
+            'open_bait_region_selector': lambda: HandleBaitRegionSelector(),
             'toggle_auto_sell_fish': lambda: HandleBoolToggle('AutomationFeatures.AutoSellFish'),
             'toggle_auto_craft_bait': lambda: HandleBoolToggle('AutomationFeatures.AutoCraftBait'),
             'toggle_auto_use_potion_brew': lambda: HandleBoolToggle('AutomationFeatures.AutoUsePotionBrew'),
@@ -3817,6 +4060,7 @@ def HandleClearCache():
         MacroSystem.State.ConsecutiveRecastTimeouts = 0
         MacroSystem.State.TopBaitCounter = 0
         MacroSystem.State.SellCounter = 0
+        MacroSystem.State.BaitRescanNeeded = True
 
         MacroSystem.State.TotalFishCaught = 0
         MacroSystem.State.CumulativeUptime = 0
@@ -3906,6 +4150,53 @@ def HandleOCRAreaSelector():
     
     threading.Thread(target=RunSelector, daemon=True).start()
     return jsonify({"status": "opening_selector"})
+
+def HandleBaitTierOrder(Payload):
+    Tiers = [T.strip() for T in (Payload or '').split(',') if T.strip()]
+    if not Tiers:
+        return jsonify({"status": "error", "message": "Enter at least one bait name"}), 400
+
+    MacroSystem.Config.Settings['BaitSelector']['TierOrder'] = Tiers
+    MacroSystem.Config.SaveToDisk()
+    MacroSystem.State.BaitRescanNeeded = True
+    return jsonify({"status": "success"})
+
+
+def HandleTestBaitScan():
+    Baits = MacroSystem.BaitReader.ScanBaits()
+    if Baits is None:
+        return jsonify({"status": "error", "message": "OCR is unavailable"}), 500
+    return jsonify({"status": "success", "baits": [{"name": B['Name'], "count": B['Count']} for B in Baits]})
+
+
+def HandleBaitRegionSelector():
+    def OnBaitRegionComplete(Coords):
+        MacroSystem.Config.Settings['BaitSelector']['Region'] = Coords
+        MacroSystem.Config.SaveToDisk()
+        MacroSystem.State.BaitRescanNeeded = True
+        MacroSystem.ActiveRegionSelector = None
+        MacroSystem.RegionSelectorActive = False
+
+    if MacroSystem.RegionSelectorActive:
+        if MacroSystem.ActiveRegionSelector:
+            try:
+                MacroSystem.ActiveRegionSelector.RootWindow.after(10, MacroSystem.ActiveRegionSelector.CloseWindow)
+            except:
+                pass
+        return jsonify({"status": "already_open"})
+
+    MacroSystem.RegionSelectorActive = True
+
+    def RunSelector():
+        try:
+            MacroSystem.ActiveRegionSelector = RegionSelectionWindow(None, MacroSystem.Config.Settings['BaitSelector']['Region'], OnBaitRegionComplete)
+        finally:
+            MacroSystem.RegionSelectorActive = False
+            MacroSystem.ActiveRegionSelector = None
+
+    threading.Thread(target=RunSelector, daemon=True).start()
+    return jsonify({"status": "opening_selector"})
+
 
 def RunFlaskServer():
     FlaskApp.run(host='0.0.0.0', port=Port, debug=False, use_reloader=False)
