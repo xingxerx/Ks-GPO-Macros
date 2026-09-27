@@ -21,7 +21,6 @@
     "core:window:allow-center",
     "core:window:allow-set-always-on-top",
     "core:window:allow-hide",
-    "shell:allow-open",
     "store:default"
   ]
 }

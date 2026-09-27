@@ -9,9 +9,9 @@ import platform
 import re
 import shutil
 import uuid
-import hashlib
 from datetime import datetime, timezone
 import traceback
+import logging
 import webbrowser
 import psutil
 
@@ -26,7 +26,6 @@ from PIL import Image as PILImage
 import requests
 from difflib import get_close_matches
 from scipy.fft import fft
-import sounddevice as sd
 import pyaudiowpatch as pyaudio
 import argparse
 import socket
@@ -37,11 +36,10 @@ import win32gui
 import win32con
 import win32api
 import win32ts
-import winreg
 import cv2
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
 
 LogDir = os.path.join(os.getcwd(), 'logs')
 VisionDir = os.path.join(LogDir, 'vision')
@@ -157,6 +155,8 @@ class ConfigurationManager:
                 'AutoCraftBait': False,
                 'AutoUsePotionBrew': False,
                 'AutoStoreFruit': False,
+                # Only run the store routine after the catch-time OCR spots a fruit (plus a periodic safety sweep)
+                'StoreOnlyWhenDetected': True,
                 'AutoSelectTopBait': False,
                 'SmartBaitSelect': False,
                 'AutoSellFish': False,
@@ -165,6 +165,7 @@ class ConfigurationManager:
                 'LoopsPerTopBait': 1,
                 'LoopsPerPurchase': 100,
                 'LoopsPerStore': 50,
+                'FruitSweepLoops': 25,
                 'LoopsPerCraft': 5,
                 'CraftsPerCycle': 40,
                 'FishCountPerCraft': 50,
@@ -216,7 +217,7 @@ class ConfigurationManager:
             },
             'FishingControl': {
                 'PdController': {
-                    'Kp': 1.4,
+                    'Kp': 1.0,
                     'Kd': 0.6,
                     'PdClamp': 1.0,
                     'PdApproachingDamping': 2.0,
@@ -258,7 +259,7 @@ class ConfigurationManager:
                 },
                 'AntiDetection': {
                     'CursorAntiDetectDelay': 0.05,
-                    'AntiMacroSpamDelay': 0.25
+                    'AntiMacroSpamDelay': 0.05
                 },
                 'Crafting': {
                     'MoveDuration': 0,
@@ -398,6 +399,7 @@ class ConfigurationManager:
             self.Settings['AutomationFeatures']['AutoBuyBait'] = Auto.get("AutoBuyCommonBait", False)
             self.Settings['AutomationFeatures']['AutoCraftBait'] = Auto.get("AutoCraftBait", False)
             self.Settings['AutomationFeatures']['AutoStoreFruit'] = Auto.get("AutoStoreDevilFruit", False)
+            self.Settings['AutomationFeatures']['StoreOnlyWhenDetected'] = Auto.get("StoreOnlyWhenDetected", True)
             self.Settings['AutomationFeatures']['AutoSelectTopBait'] = Auto.get("AutoSelectTopBait", False)
             self.Settings['AutomationFeatures']['SmartBaitSelect'] = Auto.get("SmartBaitSelect", False)
             self.Settings['AutomationFeatures']['AutoSellFish'] = Auto.get("AutoSellFish", False)
@@ -408,6 +410,7 @@ class ConfigurationManager:
             self.Settings['AutomationFrequencies']['LoopsPerTopBait'] = Freq.get("LoopsPerTopBait", 1)
             self.Settings['AutomationFrequencies']['LoopsPerPurchase'] = Freq.get("LoopsPerPurchase", 100)
             self.Settings['AutomationFrequencies']['LoopsPerStore'] = Freq.get("LoopsPerStore", 50)
+            self.Settings['AutomationFrequencies']['FruitSweepLoops'] = Freq.get("FruitSweepLoops", 25)
             self.Settings['AutomationFrequencies']['LoopsPerCraft'] = Freq.get("LoopsPerCraft", 5)
             self.Settings['AutomationFrequencies']['CraftsPerCycle'] = Freq.get("CraftsPerCycle", 40)
             self.Settings['AutomationFrequencies']['FishCountPerCraft'] = Freq.get("FishCountPerCraft", 50)
@@ -542,6 +545,7 @@ class ConfigurationManager:
                 "AutomationFeatures": {
                     "AutoBuyCommonBait": self.Settings['AutomationFeatures']['AutoBuyBait'],
                     "AutoStoreDevilFruit": self.Settings['AutomationFeatures']['AutoStoreFruit'],
+                    "StoreOnlyWhenDetected": self.Settings['AutomationFeatures']['StoreOnlyWhenDetected'],
                     "AutoSelectTopBait": self.Settings['AutomationFeatures']['AutoSelectTopBait'],
                     "SmartBaitSelect": self.Settings['AutomationFeatures']['SmartBaitSelect'],
                     "AutoUsePotionBrew": self.Settings['AutomationFeatures']['AutoUsePotionBrew'],
@@ -581,6 +585,8 @@ class MacroStateManager:
         self.LastDevilFruit = None
         # Fruits counted at catch time that the store cycle hasn't handled yet, so storing them doesn't count twice
         self.FruitsCountedBeforeStore = []
+        # Set when the catch-time scan sees a fruit; the next pre-cast stores it
+        self.FruitPendingStore = False
         self.LastCaughtFruitTime = 0
         self.CumulativeUptime = 0
         self.SessionStartTime = None
@@ -720,11 +726,17 @@ class OCRManager:
     def __init__(self):
         self.Reader = None
         self.Enabled = True
+        self.Loading = False
         # Spawn detection runs on its own thread, so serialize readtext calls on the shared reader
         self.Lock = Lock()
 
     def Initialize(self):
-        if self.Reader is None and self.Enabled:
+        # Called from the startup warm-up timer and lazily by scans; only ever start one loader
+        with self.Lock:
+            if self.Loading:
+                return
+            self.Loading = self.Reader is None and self.Enabled
+        if self.Loading:
             try:
                 def LoadOCR():
                     try:
@@ -744,6 +756,9 @@ class OCRManager:
                 print(f"OCR Thread Error: {E}")
                 self.Enabled = False
     
+    def IsReady(self):
+        return self.Enabled and self.Reader is not None
+
     def WaitForInitialization(self, TimeoutSeconds=30):
         StartTime = time.time()
         while self.Reader is None and (time.time() - StartTime) < TimeoutSeconds:
@@ -1176,7 +1191,7 @@ class WebhookNotifier:
 class ColorDetector:
     
     @staticmethod
-    def DetectBlackScreen(ScanRegion, ImageArray=None):
+    def DetectBlackScreen(ScanRegion, ImageArray=None, Threshold=0.5):
         if ImageArray is None:
             with mss.mss() as ScreenCapture:
                 CaptureRegion = {
@@ -1193,7 +1208,7 @@ class ColorDetector:
         TotalPixels = ImageArray.shape[0] * ImageArray.shape[1]
         BlackRatio = TotalBlack / TotalPixels
         
-        return BlackRatio >= 0.5
+        return BlackRatio >= Threshold
     
     @staticmethod
     def DetectGreenish(TargetPoint, Tolerance=20):
@@ -1843,7 +1858,7 @@ class FishingMinigameController:
                 Screenshot = Capture.grab(Region)
                 Image = np.array(Screenshot)
             
-            if ColorDetector.DetectBlackScreen(ScanArea, Image):
+            if ColorDetector.DetectBlackScreen(ScanArea, Image, self.Config.Settings['FishingControl']['Detection']['BlackScreenThreshold']):
                 BlackScreenCount = BlackScreenCount + 1 if 'BlackScreenCount' in locals() else 1
                 if BlackScreenCount >= 3:
                     self.State.UpdateStatus("Multiple black screens detected - recasting")
@@ -2015,7 +2030,7 @@ class FishingMinigameController:
         Now = time.time()
         self.Snapshot(Image, 'start')
 
-        if ColorDetector.DetectBlackScreen(ScanArea, Image):
+        if ColorDetector.DetectBlackScreen(ScanArea, Image, self.Config.Settings['FishingControl']['Detection']['BlackScreenThreshold']):
             self.Snapshot(Image, 'black_screen')
             self.Trace(Now, "black screen -> release")
             self.SetMouse(False, Now)
@@ -2076,10 +2091,13 @@ class FishingMinigameController:
         ErrorRate = self.WhiteVel - self.TargetVel
         Closing = (Error > 0 and ErrorRate < 0) or (Error < 0 and ErrorRate > 0)
         LeadTime = Pd['Kd'] * 0.1 * (Pd['PdApproachingDamping'] if Closing else Pd['PdChasingDamping'])
-        Predicted = Error + ErrorRate * LeadTime
+        # Max Correction Clamp caps how far ahead the prediction may look, as a fraction of the bar's length
+        MaxLead = max(Pd['PdClamp'], 0.0) * (Reading['Bottom'] - Reading['Top'])
+        Predicted = Error + max(-MaxLead, min(MaxLead, ErrorRate * LeadTime))
 
-        # Hysteresis: inside the deadband keep doing what we were doing, which stops click chatter when centred
-        Deadband = max(2.0, WhiteHeight * 0.5)
+        # Hysteresis: inside the deadband keep doing what we were doing, which stops click chatter when centred.
+        # Kp is the proportional gain: higher reacts to smaller offsets (1.0 = a half line-height deadband)
+        Deadband = max(2.0, WhiteHeight * 0.5) / max(Pd['Kp'], 0.1)
         if abs(Predicted) < Deadband:
             ShouldHold = self.State.MousePressed
         else:
@@ -2429,7 +2447,11 @@ class AutomatedFishingSystem:
                 if not self.MinigameController.WaitForBobber():
                     self.State.UpdateStatus("Bobber timeout - recasting")
                     self.State.HandleRecastTimeout()
-                    
+                    # A cast that never produced a bobber usually means the rod wasn't in hand (a dropped key
+                    # press), and EquipRod skips when it thinks the rod is out, so force a real re-equip now
+                    # instead of waiting for three full timeouts
+                    self.State.RodEquipped = False
+
                     LogOpts = self.Config.Settings['LoggingOptions']
                     if self.Config.Settings['DevilFruitStorage']['WebhookUrl'] and LogOpts['LogRecastTimeouts']:
                         if self.State.ConsecutiveRecastTimeouts == 3:
@@ -2603,11 +2625,12 @@ class AutomatedFishingSystem:
             return False
         
         if self.Config.Settings['AutomationFeatures']['AutoStoreFruit']:
-            if ForcePreCast or self.State.FruitStorageCounter == 0 or self.State.FruitStorageCounter >= self.Config.Settings['AutomationFrequencies']['LoopsPerStore']:
+            if self.FruitStorageDue(ForcePreCast):
                 self.ExecuteFruitStorage()
                 if not self.State.IsRunning:
                     return False
                 self.State.FruitStorageCounter = 1
+                self.State.FruitPendingStore = False
             else:
                 self.State.FruitStorageCounter += 1
         
@@ -2666,6 +2689,20 @@ class AutomatedFishingSystem:
         self.State.UpdateStatus("Pre-cast complete")
         return True
     
+    def FruitStorageDue(self, ForcePreCast=False):
+        Freq = self.Config.Settings['AutomationFrequencies']
+        Counter = self.State.FruitStorageCounter
+        if ForcePreCast or Counter == 0:
+            return True
+        # Storing walks every fruit slot and swaps the rod out, so after each catch it cost seconds even with
+        # no fruit caught. With OCR loaded the catch-time scan says when a fruit landed; sweep occasionally for misses
+        if self.Config.Settings['AutomationFeatures']['StoreOnlyWhenDetected'] and self.OcrManager.IsReady():
+            if self.State.FruitPendingStore:
+                return True
+            SweepLoops = Freq.get('FruitSweepLoops', 25)
+            return SweepLoops > 0 and Counter >= SweepLoops
+        return Counter >= Freq['LoopsPerStore']
+
     def ExecuteCraftingCycle(self):
         self.State.UpdateStatus("Starting crafting cycle")
         
@@ -2715,6 +2752,7 @@ class AutomatedFishingSystem:
                 continue
             
             self.InputController.ClickPoint(Recipe['BaitRecipePoint'])
+            time.sleep(Delays['CraftRecipeSelectDelay'])
             if not self.State.IsRunning:
                 return
             
@@ -2726,16 +2764,18 @@ class AutomatedFishingSystem:
                     return
                 
                 self.InputController.ClickPoint(Points['AddRecipe'])
+                time.sleep(Delays['CraftAddRecipeDelay'])
                 if not self.State.IsRunning:
                     return
                 
                 self.InputController.ClickPoint(Points['TopRecipe'])
+                time.sleep(Delays['CraftTopRecipeDelay'])
                 if not self.State.IsRunning:
                     return
                 
                 self.State.UpdateStatus(f"Opening craft dialog {FishIter+1}/{RecipeCycle}")
                 self.InputController.ClickPoint(Points['CraftButton'])
-                time.sleep(Delays['CraftClickDelay'])
+                time.sleep(Delays['CraftButtonClickDelay'] + Delays['CraftClickDelay'])
                 if not self.State.IsRunning:
                     return
                 
@@ -2754,6 +2794,7 @@ class AutomatedFishingSystem:
 
         self.State.UpdateStatus("Closing craft menu")
         self.InputController.ClickPoint(Points['CloseMenu'])
+        time.sleep(Delays['CraftCloseMenuDelay'])
         if not self.State.IsRunning:
             return
 
@@ -2847,6 +2888,7 @@ class AutomatedFishingSystem:
                 self.State.LastCaughtFruitTime = time.time()
                 Rarity = self.State.IncrementDevilFruitCount(FruitName)
                 self.State.FruitsCountedBeforeStore.append((FruitName, Rarity))
+                self.State.FruitPendingStore = True
                 LogLine(f"FRUIT caught {FruitName} ({Rarity})")
                 self.Notifier.SendNotification(f"Devil Fruit {FruitName} ({Rarity}) caught!")
                 return
@@ -3225,10 +3267,10 @@ class AutomatedFishingSystem:
         time.sleep(Delays['BrewUseDelay'])
         self.State.UpdateStatus("Potion brew used successfully")
 
-    def TapKey(self, Key, HoldTime=0.05):
-        # Roblox drops zero-length taps; hold the key briefly so it registers
+    def TapKey(self, Key):
+        # Roblox drops zero-length taps; hold the key briefly (Key Spam Prevention) so it registers
         keyboard.press(Key)
-        time.sleep(HoldTime)
+        time.sleep(max(self.Config.Settings['TimingDelays']['AntiDetection']['AntiMacroSpamDelay'], 0.02))
         keyboard.release(Key)
 
     def EquipRod(self):
@@ -3370,6 +3412,10 @@ class AutomatedFishingSystem:
             "activeSessions": ActiveSessions,
             "storeToBackpack": self.Config.Settings['DevilFruitStorage']['StoreToBackpack'],
             "loopsPerStore": self.Config.Settings['AutomationFrequencies']['LoopsPerStore'],
+            "fruitSweepLoops": self.Config.Settings['AutomationFrequencies'].get('FruitSweepLoops', 25),
+            "storeOnlyWhenDetected": self.Config.Settings['AutomationFeatures']['StoreOnlyWhenDetected'],
+            "fruitPendingStore": self.State.FruitPendingStore,
+            "ocrStatus": "ready" if self.OcrManager.IsReady() else ("loading" if self.OcrManager.Enabled else "off"),
             "isRunning": self.State.IsRunning,
             "fishCaught": self.State.TotalFishCaught,
             "devilFruitsCaught": self.State.TotalDevilFruits,
@@ -3504,7 +3550,6 @@ FlaskApp = Flask(__name__)
 CORS(FlaskApp)
 
 MacroSystem = AutomatedFishingSystem()
-MacroSystem.OcrManager.Initialize()
 
 Port = FindFreePort()
 
@@ -3856,6 +3901,8 @@ def ProcessCommand():
             'set_client_id': lambda: HandleStringValue('ClientId'),
             
             'set_loops_per_store': lambda: HandleIntValue('AutomationFrequencies.LoopsPerStore'),
+            'set_fruit_sweep_loops': lambda: HandleIntValue('AutomationFrequencies.FruitSweepLoops'),
+            'toggle_store_only_when_detected': lambda: HandleBoolToggle('AutomationFeatures.StoreOnlyWhenDetected'),
             'set_loops_per_purchase': lambda: HandleIntValue('AutomationFrequencies.LoopsPerPurchase'),
             'set_fish_count_per_craft': lambda: HandleIntValue('AutomationFrequencies.FishCountPerCraft'),
             'set_crafts_per_cycle': lambda: HandleIntValue('AutomationFrequencies.CraftsPerCycle'),
@@ -4319,8 +4366,12 @@ def RunFlaskServer():
 
 
 if __name__ == "__main__":
+    # One access-log line per request floods the console: the UI polls /state several times a second
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
     ServerThread = threading.Thread(target=RunFlaskServer, daemon=True)
     ServerThread.start()
+    # Load OCR (easyocr + torch, several seconds) after the server is up so it doesn't hold up the launcher
+    threading.Timer(3.0, MacroSystem.OcrManager.Initialize).start()
     try:
         while True:
             time.sleep(1)

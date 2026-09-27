@@ -33,6 +33,38 @@ src-tauri/juzo.py
 /src-tauri/saved-hashes
 /src-tauri/hashes
 
+# Debug screenshots and runtime output (backend writes these next to backend.py / the working dir)
+logs/
+**/logs/
+**/FruitScanDebug/
+**/vision/
+*.png.tmp
+/src-tauri/port_*.json
+/src-tauri/gen/
+
+# Per-user settings: hold Discord webhook URLs, Discord user IDs and click coordinates for this PC.
+# The backend recreates them with defaults when missing, so they never need to be committed
+/src-tauri/Auto Fish Settings.json
+/src-tauri/Juzo Settings.json
+*.json.backup
+*.json.backup_*
+*.backup
+
+# Credentials and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+credentials*.json
+secrets*.json
+*.secret
+*token*.txt
+
 # Python
 .venv/
 venv/

@@ -232,6 +232,21 @@ body {
   background: var(--green);
 }
 
+.status-detail {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text2);
+  padding: 0 2px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-detail .status-fish {
+  color: var(--text3);
+}
+
 .rdp-dot {
   width: 7px;
   height: 7px;

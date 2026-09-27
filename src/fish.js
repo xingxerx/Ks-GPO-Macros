@@ -149,6 +149,31 @@ function updateStatus(isRunning) {
     document.getElementById('statusText').textContent = isRunning ? 'Active' : 'Inactive';
 }
 
+// Live view of the macro loop, so the window shows the step it is on rather than just on/off
+function updateMacroActivity(state) {
+    const statusEl = document.getElementById('macroStatusText');
+    if (statusEl) {
+        const status = state.currentStatus || 'Idle';
+        statusEl.textContent = status;
+        statusEl.title = status;
+    }
+    const fishEl = document.getElementById('macroFishText');
+    if (fishEl) {
+        const rate = state.isRunning && state.fishPerHour ? ` · ${state.fishPerHour}/hr` : '';
+        fishEl.textContent = `${state.fishCaught || 0} fish · ${state.devilFruitsCaught || 0} fruit${rate}`;
+    }
+}
+
+function updateFruitDetectStatus(state) {
+    const el = document.getElementById('fruitDetectStatus');
+    if (!el || state.ocrStatus === undefined) return;
+    const labels = { ready: 'Ready', loading: 'Loading OCR…', off: 'Off (fast mode or OCR failed)' };
+    let text = labels[state.ocrStatus] || state.ocrStatus;
+    if (state.ocrStatus === 'ready' && state.fruitPendingStore) text = 'Fruit caught — storing next cast';
+    el.textContent = text;
+    el.className = 'point-badge ' + (state.ocrStatus === 'ready' ? 'set' : 'unset');
+}
+
 function updateHotkey(key, value) {
     const el = document.getElementById(`hotkey-${key}`);
     if (el) el.textContent = value.toUpperCase();
@@ -258,12 +283,18 @@ function closeDisclaimer() {
     document.getElementById('disclaimerModal').classList.add('hidden');
 }
 
+let lastRenderedBackpackKey = null;
+
 function renderBackpackLocationRows(slots, locations) {
     const container = document.getElementById('backpackLocationsContainer');
     const hint = document.getElementById('backpackLocationsHint');
     if (!container) return;
 
     const storeToBackpackEnabled = document.getElementById('storeToBackpackToggle')?.classList.contains('active');
+
+    const key = JSON.stringify([storeToBackpackEnabled, slots, locations]);
+    if (key === lastRenderedBackpackKey) return;
+    lastRenderedBackpackKey = key;
 
     container.innerHTML = '';
 
@@ -421,10 +452,16 @@ function showCurrentSlide() {
     if (target) target.classList.add('visible');
 }
 
+let lastRenderedSlotsKey = null;
+
 function renderDevilFruitSlotSelector(selectedSlots) {
     const container = document.getElementById('devilFruitSlotSelector');
     if (!container) { setTimeout(() => renderDevilFruitSlotSelector(selectedSlots), 100); return; }
     if (!Array.isArray(selectedSlots)) selectedSlots = ['3'];
+    // Polling calls this every tick; rebuilding unchanged buttons could swallow a click mid-rebuild
+    const key = selectedSlots.join(',');
+    if (key === lastRenderedSlotsKey && container.children.length) return;
+    lastRenderedSlotsKey = key;
     container.innerHTML = '';
     for (let i = 0; i <= 9; i++) {
         const btn = document.createElement('button');
@@ -482,7 +519,7 @@ function toggleSetting(settingName) {
     sendToPython(`toggle_${settingName.replace(/([A-Z])/g, '_$1').toLowerCase()}`, isActive.toString());
 
     if (settingName === 'storeToBackpack') {
-        renderBackpackLocationRows(window.currentDevilFruitHotkeys || [], window.currentBackpackLocations || []);
+        renderBackpackLocationRows(window.currentDevilFruitSlots || [], window.currentBackpackLocations || []);
     }
 
     setTimeout(() => { activeElement = null; skipNextUpdate.delete(`${settingName}Toggle`); }, 1000);
@@ -750,6 +787,9 @@ function loadAllSettings(state) {
     setExpandableSection('autoSelectBaitToggle', 'autoSelectBaitExpand', state.autoSelectTopBait);
     updateSmartBait(state);
     setToggleState('storeToBackpackToggle', state.storeToBackpack);
+    setToggleState('storeOnlyWhenDetectedToggle', state.storeOnlyWhenDetected !== false);
+    setInputValue('fruitSweepLoops', state.fruitSweepLoops != null ? state.fruitSweepLoops : 25);
+    updateFruitDetectStatus(state);
 
     setExpandableSection('autoSellFishToggle', 'autoSellExpand', state.autoSellFish || false);
     setInputValue('sellRepeatCount', state.sellRepeatCount != null ? state.sellRepeatCount : 3);
@@ -795,6 +835,10 @@ function loadAllSettings(state) {
     setInputValue('craftMenuDelay', state.craftMenuOpenDelay);
     setInputValue('craftClickDelay', state.craftClickDelay);
     setInputValue('craftRecipeDelay', state.craftRecipeSelectDelay);
+    setInputValue('craftAddDelay', state.craftAddRecipeDelay);
+    setInputValue('craftTopDelay', state.craftTopRecipeDelay);
+    setInputValue('craftButtonDelay', state.craftButtonClickDelay);
+    setInputValue('craftCloseDelay', state.craftCloseMenuDelay);
     setInputValue('webhookUrl', state.webhookUrl || '');
     setInputValue('discordUserId', state.discordUserId || '');
     setInputValue('soundSensitivity', state.soundSensitivity || 0.1);
@@ -834,7 +878,6 @@ function loadAllSettings(state) {
     updatePointStatus('craftButtonPoint', state.craftButtonPoint?.x, state.craftButtonPoint?.y);
     updatePointStatus('craftConfirmPoint', state.craftConfirmPoint?.x, state.craftConfirmPoint?.y);
     updatePointStatus('closeMenuPoint', state.closeMenuPoint?.x, state.closeMenuPoint?.y);
-    updatePointStatus('devilFruitLocationPoint', state.devilFruitLocationPoint?.x, state.devilFruitLocationPoint?.y);
 
     if (state.baitRecipes !== undefined) renderRecipes(state.baitRecipes);
     window.currentBackpackLocations = state.backpackLocations || [];
@@ -868,11 +911,11 @@ async function pollPythonState() {
         const state = await res.json();
 
         updateStatus(state.isRunning);
+        updateMacroActivity(state);
 
-        if (state.hotkeys) {
-            updateHotkey('start', state.hotkeys.StartStop || state.hotkeys.start_stop || 'f1');
-            updateHotkey('exit', state.hotkeys.Exit || state.hotkeys.exit || 'f3');
-        }
+        // Same sync as startup, every tick: toggles and values changed by hotkeys, reset/import,
+        // or the macro itself show up here. Focused inputs and just-clicked toggles are left alone
+        loadAllSettings(state);
 
         if (state.is_admin !== undefined) {
             document.getElementById('adminIndicator').classList.toggle('active', state.is_admin);
@@ -884,8 +927,6 @@ async function pollPythonState() {
 
         if (state.activeSessions) renderActiveSessions(state.activeSessions);
         if (state.rdp_detected !== undefined) updateRdpIndicator(state.rdp_detected, state.rdp_session_state);
-        if (state.megalodonSoundEnabled !== undefined) setToggleState('megalodonSoundToggle', state.megalodonSoundEnabled);
-        if (state.soundSensitivity !== undefined) setInputValue('soundSensitivity', state.soundSensitivity);
 
         const clientIdEl = document.getElementById('clientIdDisplay');
         if (clientIdEl) clientIdEl.textContent = CLIENT_ID;
@@ -894,65 +935,16 @@ async function pollPythonState() {
         setExpandableSection('enableDeviceSyncToggle', 'deviceSyncExpand', state.enable_device_sync || false);
         setToggleState('syncSettingsToggle', state.sync_settings !== false);
         setToggleState('syncStatsToggle', state.sync_stats !== false);
-        setToggleState('sharesFishCountToggle', state.share_fish_count || false);
+        setToggleState('shareFishCountToggle', state.share_fish_count || false);
 
         if (state.sync_interval) setInputValue('syncInterval', state.sync_interval);
         if (state.device_name) setInputValue('deviceName', state.device_name);
-        if (state.enableSpawnDetection !== undefined) setExpandableSection('enableSpawnDetectionToggle', 'spawnDetectionExpand', state.enableSpawnDetection);
-
-        if (state.autoSellFish !== undefined) setExpandableSection('autoSellToggle', 'autoSellExpand', state.autoSellFish);
-        if (state.sellRepeatCount !== undefined) setInputValue('sellRepeatCount', state.sellRepeatCount);
-        updatePointStatus('sellLeftPoint', state.sellLeftPoint?.x, state.sellLeftPoint?.y);
-        updatePointStatus('sellMiddlePoint', state.sellMiddlePoint?.x, state.sellMiddlePoint?.y);
-        updatePointStatus('sellAcceptPoint', state.sellAcceptPoint?.x, state.sellAcceptPoint?.y);
-        updatePointStatus('sellClosePoint', state.sellClosePoint?.x, state.sellClosePoint?.y);
-        updatePointStatus('sellSelectTopPoint', state.sellSelectTopPoint?.x, state.sellSelectTopPoint?.y);
-
-        updatePointStatus('waterPoint', state.waterPoint?.x, state.waterPoint?.y);
-        updatePointStatus('leftPoint', state.leftPoint?.x, state.leftPoint?.y);
-        updatePointStatus('middlePoint', state.middlePoint?.x, state.middlePoint?.y);
-        updatePointStatus('rightPoint', state.rightPoint?.x, state.rightPoint?.y);
-        updatePointStatus('storeFruitPoint', state.storeFruitPoint?.x, state.storeFruitPoint?.y);
-        updatePointStatus('baitPoint', state.baitPoint?.x, state.baitPoint?.y);
-        updatePointStatus('craftLeftPoint', state.craftLeftPoint?.x, state.craftLeftPoint?.y);
-        updatePointStatus('craftMiddlePoint', state.craftMiddlePoint?.x, state.craftMiddlePoint?.y);
-        updatePointStatus('craftConfirmPoint', state.craftConfirmPoint?.x, state.craftConfirmPoint?.y);
-        updatePointStatus('closeMenuPoint', state.closeMenuPoint?.x, state.closeMenuPoint?.y);
-        updatePointStatus('craftButtonPoint', state.craftButtonPoint?.x, state.craftButtonPoint?.y);
-        updatePointStatus('addRecipePoint', state.addRecipePoint?.x, state.addRecipePoint?.y);
-        updatePointStatus('topRecipePoint', state.topRecipePoint?.x, state.topRecipePoint?.y);
-        updatePointStatus('devilFruitLocationPoint', state.devilFruitLocationPoint?.x, state.devilFruitLocationPoint?.y);
-
-        window.currentBackpackLocations = state.backpackLocations || [];
-        if (state.devilFruitHotkeys && state.backpackLocations !== undefined) {
-            renderBackpackLocationRows(state.devilFruitHotkeys, state.backpackLocations);
-        }
-
-        if (state.autoUsePotionBrew !== undefined) setExpandableSection('autoUsePotionBrewToggle', 'autoPotionBrewExpand', state.autoUsePotionBrew);
-        if (state.potionBrewIntervalMinutes !== undefined) setInputValue('potionBrewInterval', state.potionBrewIntervalMinutes);
-        if (state.potionBrewSlot !== undefined) setInputValue('potionBrewSlot', state.potionBrewSlot);
-
-        if (state.discordUserId !== undefined) setInputValue('discordUserId', state.discordUserId);
-        setInputValue('periodicStatsInterval', state.periodicStatsInterval || 5);
-
-        ['logDevilFruit', 'logSpawns', 'logRecastTimeouts', 'logPeriodicStats', 'logGeneralUpdates', 'logMacroState', 'logErrors'].forEach(k => {
-            if (state[k] !== undefined) setExpandableSection(`${k}Toggle`, `${k}Expand`, state[k]);
-        });
-
-        ['pingDevilFruit', 'pingSpawns', 'pingRecastTimeouts', 'pingPeriodicStats', 'pingGeneralUpdates', 'pingMacroState', 'pingErrors'].forEach(k => {
-            if (state[k] !== undefined) setToggleState(`${k}Toggle`, state[k]);
-        });
-
-        if (state.baitRecipes !== undefined) renderRecipes(state.baitRecipes);
-        updateSmartBait(state);
 
         checkRequirements('autoStoreFruit');
         checkRequirements('autoBuyBait');
         checkRequirements('autoCraftBait');
         checkRequirements('autoSelectBait');
         checkRequirements('autoSellFish');
-        checkRequirements('enableSpawnDetection');
-        console.log('hotkeys:', state.devilFruitHotkeys, 'locations:', state.backpackLocations);
     } catch (e) { }
 }
 

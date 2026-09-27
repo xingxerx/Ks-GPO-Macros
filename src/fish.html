@@ -113,6 +113,8 @@
           <span class="status-dot" id="statusDot"></span>
           <span id="statusText">Inactive</span>
         </div>
+        <div class="status-detail" id="macroStatusText" title="What the macro is doing right now">Idle</div>
+        <div class="status-detail"><span class="status-fish" id="macroFishText">0 fish · 0 fruit</span></div>
         <div class="rdp-pill" id="rdpIndicator">
           <span class="rdp-dot"></span>
           <span id="rdpText">Local</span>
@@ -616,10 +618,27 @@
             <div class="row-hint" id="backpackLocationsHint">
               Set a location for each devil fruit slot — leave unset to use the default Backpack Location above.
             </div>
+            <div class="row-item">
+              <span class="row-label">Only store when a fruit is caught</span>
+              <div class="row-ctrl">
+                <div class="toggle" id="storeOnlyWhenDetectedToggle" onclick="toggleSetting('storeOnlyWhenDetected')"></div>
+              </div>
+            </div>
+            <div class="row-item"><span class="row-label">Safety sweep every N loops</span>
+              <div class="row-ctrl"><input type="number" class="inp" id="fruitSweepLoops" value="25" step="1" min="0"
+                  onchange="sendToPython('set_fruit_sweep_loops',this.value)"><span class="unit">loops</span></div>
+            </div>
             <div class="row-item"><span class="row-label">Store every N loops</span>
               <div class="row-ctrl"><input type="number" class="inp" id="loopsPerStore" value="1" step="1" min="1"
                   onchange="sendToPython('set_loops_per_store',this.value)"><span class="unit">loops</span></div>
             </div>
+            <div class="row-item">
+              <span class="row-label">Fruit detection</span>
+              <div class="row-ctrl">
+                <span class="point-badge unset" id="fruitDetectStatus">Checking…</span>
+              </div>
+            </div>
+            <div class="row-hint">With "Only store when a fruit is caught" on, the rod is only swapped out after the catch popup shows a devil fruit, plus a safety sweep every N loops (0 = never) in case a popup is missed. "Store every N loops" is used instead while fruit detection is off or still loading.</div>
           </div>
         </div>
 
@@ -632,7 +651,7 @@
               </div>
             </div>
           </div>
-          <div class="warn-box hidden" id="autoSellWarning">
+          <div class="warn-box hidden" id="autoSellFishWarning">
             Set all sell points in Locations → Fish Sell Shop before enabling.
           </div>
           <div class="expandable" id="autoSellExpand">
@@ -706,7 +725,7 @@
         <div class="section-title">PD Controller</div>
         <div class="panel">
           <div class="row-item"><span class="row-label">Proportional Gain (Kp)</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="kp" value="0.9" step="0.1"
+            <div class="row-ctrl"><input type="number" class="inp" id="kp" value="1.0" step="0.1"
                 onchange="sendToPython('set_kp',this.value)"></div>
           </div>
           <div class="row-item"><span class="row-label">Derivative Gain (Kd)</span>
@@ -717,7 +736,7 @@
             <div class="row-ctrl"><input type="number" class="inp" id="pdClamp" value="1.0" step="0.1"
                 onchange="sendToPython('set_pd_clamp',this.value)"></div>
           </div>
-          <div class="row-hint">PD control maintains alignment between fishing bar and target</div>
+          <div class="row-hint">Kp: higher reacts to smaller offsets between fish line and catch zone (1.0 = default). Kd: how far ahead the controller predicts. Clamp: caps that prediction as a fraction of the bar length.</div>
         </div>
 
         <div class="section-title">Advanced PD</div>
@@ -748,12 +767,13 @@
         <div class="panel">
           <div class="row-item"><span class="row-label">Black Screen Threshold</span>
             <div class="row-ctrl"><input type="number" class="inp" id="blackThreshold" value="0.5" step="0.05"
-                onchange="sendToPython('set_black_threshold',this.value)"><span class="unit">%</span></div>
+                onchange="sendToPython('set_black_threshold',this.value)"><span class="unit">ratio</span></div>
           </div>
           <div class="row-item"><span class="row-label">Key Spam Prevention</span>
             <div class="row-ctrl"><input type="number" class="inp" id="spamDelay" value="0.25" step="0.05"
                 onchange="sendToPython('set_spam_delay',this.value)"><span class="unit">sec</span></div>
           </div>
+          <div class="row-hint">Black screen: fraction of the scan area that must be pure black to count as a loading screen. Key spam: how long each hotbar key is held so Roblox registers it.</div>
         </div>
       </div>
 
@@ -1084,7 +1104,7 @@
             </div>
             <div class="row-item"><span class="row-label">Share Fish Count</span>
               <div class="row-ctrl">
-                <div class="toggle" id="sharesFishCountToggle" onclick="toggleSetting('shareFishCount')"></div>
+                <div class="toggle" id="shareFishCountToggle" onclick="toggleSetting('shareFishCount')"></div>
               </div>
             </div>
             <div class="row-item"><span class="row-label">Sync Interval</span>

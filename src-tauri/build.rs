@@ -4,8 +4,6 @@ use std::path::PathBuf;
 use std::fs;
 use std::env;
 
-#[allow(unused_imports)]
-use winres::WindowsResource;
 
 const SKIP_DIRS: &[&str] = &[
     "__pycache__",
@@ -206,12 +204,7 @@ fn HashRequirements(Path: &PathBuf) -> String {
 }
 
 fn main() {
-    if cfg!(target_os = "windows") {
-        let mut ResourceBuilder = winres::WindowsResource::new();
-        ResourceBuilder.set_icon("icons/icon.ico");
-        ResourceBuilder.compile().unwrap();
-    }
-
+    // tauri_build embeds the exe icon and version info; a second copy via winres made the link fail (duplicate VERSION)
     let BuildProfile          = env::var("PROFILE").unwrap_or_default();
     let SrcTauriPath          = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let PythonDestinationPath = SrcTauriPath.join("Python314");
