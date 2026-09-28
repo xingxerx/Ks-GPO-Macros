@@ -121,12 +121,13 @@
             <span class="StatLabel">Devil Fruits</span>
             <span class="DevilFruitValue" id="DevilFruitCount">0</span>
         </div>
-        <div class="RarityLine" title="Common / Rare / Epic / Legendary / Mythical">
+        <div class="RarityLine" title="Common / Rare / Epic / Legendary / Mythical / Other (not legendary, rarity not shown)">
             <span class="Rarity-Common">C <span id="RarityCommon">0</span></span>
             <span class="Rarity-Rare">R <span id="RarityRare">0</span></span>
             <span class="Rarity-Epic">E <span id="RarityEpic">0</span></span>
             <span class="Rarity-Legendary">L <span id="RarityLegendary">0</span></span>
             <span class="Rarity-Mythical">M <span id="RarityMythical">0</span></span>
+            <span class="Rarity-Unknown">? <span id="RarityUnknown">0</span></span>
         </div>
         <div class="StatLine">
             <span class="StatLabel">Last Fruit</span>
@@ -148,16 +149,19 @@
 
     <script>
         let StatsPort = 0;
-        let pollTimer = null;
+        let Polling = false;
 
         function ApplyStatsPort(port) {
             if (!port || port <= 0) return;
-            if (StatsPort === port) return;
             StatsPort = port;
-
-            if (pollTimer) clearInterval(pollTimer);
-            pollTimer = setInterval(PollStats, 500);
-            PollStats();
+            if (Polling) return;
+            Polling = true;
+            // Chained so a slow response never stacks requests; hidden (macro stopped) polls slowly
+            const Tick = async () => {
+                await PollStats();
+                setTimeout(Tick, document.hidden ? 2000 : 500);
+            };
+            Tick();
         }
 
         if (window.__TAURI__?.event?.listen) {
@@ -184,25 +188,23 @@
         async function PollStats() {
             if (!StatsPort) return;
             try {
-                const Response = await fetch(`http://localhost:${StatsPort}/state`);
+                const Response = await fetch(`http://127.0.0.1:${StatsPort}/state?live=1`);
                 const State = await Response.json();
 
                 document.getElementById('FishCount').textContent = State.fishCaught || 0;
                 document.getElementById('DevilFruitCount').textContent = State.devilFruitsCaught || 0;
                 const ByRarity = State.devilFruitsByRarity || {};
-                ['Common', 'Rare', 'Epic', 'Legendary', 'Mythical'].forEach(R => {
+                ['Common', 'Rare', 'Epic', 'Legendary', 'Mythical', 'Unknown'].forEach(R => {
                     document.getElementById(`Rarity${R}`).textContent = ByRarity[R] || 0;
                 });
                 const Last = State.lastDevilFruit;
                 const LastEl = document.getElementById('LastFruit');
-                LastEl.textContent = Last ? Last.name : '-';
+                LastEl.textContent = !Last ? '-' : Last.name !== 'Unknown' ? Last.name : Last.rarity === 'Legendary' ? 'Legendary' : 'Fruit';
                 LastEl.className = Last ? `Rarity-${Last.rarity}` : 'StatValue';
                 document.getElementById('TimeElapsed').textContent = State.timeElapsed || '0:00:00';
                 document.getElementById('FishPerHour').textContent = (State.fishPerHour || 0).toFixed(1);
                 document.getElementById('CurrentStatus').textContent = State.currentStatus || 'Idle';
-            } catch (Error) {
-                console.error('Failed to poll stats:', Error);
-            }
+            } catch (_) { }
         }
 
         InitStatsPort();

@@ -4,11 +4,8 @@ import time
 import json
 import threading
 from threading import Lock
-import subprocess
-import platform
 import re
 import shutil
-import uuid
 from datetime import datetime, timezone
 import traceback
 import logging
@@ -24,18 +21,17 @@ import keyboard
 from pynput import mouse
 from PIL import Image as PILImage
 import requests
-from difflib import get_close_matches
+from difflib import get_close_matches, SequenceMatcher
 from scipy.fft import fft
 import pyaudiowpatch as pyaudio
 import argparse
 import socket
 
 import ctypes
-from ctypes import wintypes
+
 import win32gui
 import win32con
 import win32api
-import win32ts
 import cv2
 
 import tkinter as tk
@@ -82,7 +78,7 @@ def FindFreePort(Start=8765, MaxAttempts=50):
     for Port in range(Start, Start + MaxAttempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as S:
             try:
-                S.bind(('0.0.0.0', Port))
+                S.bind(('127.0.0.1', Port))
                 return Port
             except OSError:
                 continue
@@ -131,50 +127,30 @@ class ConfigurationManager:
                 'Bait': None,
                 'StoreFruit': None,
                 'BackpackLocations': [],
-                'CraftLeft': None,
-                'CraftMiddle': None,
-                'CraftButton': None,
-                'CraftConfirm': None,
-                'CloseMenu': None,
-                'AddRecipe': None,
-                'TopRecipe': None,
-                'SellLeft': None,
-                'SellMiddle': None,
-                'SellSelectTop': None,
-                'SellAccept': None,
-                'SellClose': None,
             },
             'InventoryHotkeys': {
                 'Rod': '1',
                 'Alternate': '2',
                 'DevilFruits': ['3'],
-                'PotionBrewSlot': '4'
             },
             'AutomationFeatures': {
                 'AutoBuyBait': False,
-                'AutoCraftBait': False,
-                'AutoUsePotionBrew': False,
                 'AutoStoreFruit': False,
                 # Only run the store routine after the catch-time OCR spots a fruit (plus a periodic safety sweep)
                 'StoreOnlyWhenDetected': True,
                 'AutoSelectTopBait': False,
                 'SmartBaitSelect': False,
-                'AutoSellFish': False,
             },
             'AutomationFrequencies': {
                 'LoopsPerTopBait': 1,
                 'LoopsPerPurchase': 100,
                 'LoopsPerStore': 50,
                 'FruitSweepLoops': 25,
-                'LoopsPerCraft': 5,
-                'CraftsPerCycle': 40,
-                'FishCountPerCraft': 50,
-                'SellRepeatCount': 3,
-                'LoopsPerSell': 50,
-                'PotionBrewIntervalMinutes': 30,
             },
             'DevilFruitStorage': {
                 'StoreToBackpack': False,
+                # Off: a fruit the game refuses to store (a duplicate) stays in the hotbar instead of being dropped
+                'DropUnstorable': False,
                 'WebhookUrl': ''
             },
             'LoggingOptions': {
@@ -199,20 +175,6 @@ class ConfigurationManager:
             },
             'AudioDevice': {
                 'SelectedDeviceIndex': None,
-                'DeviceName': ''
-            },
-            'RDPSettings': {
-                'AutoDetectRDP': True,
-                'AllowRDPExecution': True,
-                'PauseOnRDPDisconnect': True,
-                'ResumeOnRDPReconnect': False
-            },
-            'DeviceSyncSettings': {
-                'EnableDeviceSync': False,
-                'SyncSettings': True,
-                'SyncStats': True,
-                'ShareFishCount': False,
-                'SyncIntervalSeconds': 5,
                 'DeviceName': ''
             },
             'FishingControl': {
@@ -261,26 +223,6 @@ class ConfigurationManager:
                     'CursorAntiDetectDelay': 0.05,
                     'AntiMacroSpamDelay': 0.05
                 },
-                'Crafting': {
-                    'MoveDuration': 0,
-                    'CraftMenuOpenDelay': 0.85,
-                    'CraftClickDelay': 0.2,
-                    'CraftRecipeSelectDelay': 0.2,
-                    'CraftAddRecipeDelay': 0.2,
-                    'CraftTopRecipeDelay': 0.2,
-                    'CraftButtonClickDelay': 0.025,
-                    'CraftCloseMenuDelay': 0.2
-                },
-                'PotionBrew': {
-                    'BrewEquipDelay': 0.3,
-                    'BrewUseDelay': 4.5,
-                },
-            },
-            'SpawnDetection': {
-                'EnableSpawnDetection': False,
-                'ScanInterval': 5.0,
-                'LogSpawns': True,
-                'PingSpawns': False
             },
             'OCRSettings': {
                 'X1': int(MonitorWidth * 0.40),
@@ -289,9 +231,9 @@ class ConfigurationManager:
                 'Y2': int(MonitorHeight * 0.20)
             },
             'BaitSelector': {
-                # Preferred bait first. The first tier is the one Auto Buy restocks; later tiers are
-                # insurance, only used once it runs out and a purchase fails (e.g. out of money)
-                'TierOrder': ['Common Fish Bait', 'Rare Fish Bait', 'Legendary Fish Bait'],
+                # Used best first. Devil fruits don't come from common bait, so it goes last; Auto Buy
+                # restocks the shop bait (ShopBaitName) once it runs out
+                'TierOrder': ['Rare Fish Bait', 'Legendary Fish Bait', 'Common Fish Bait'],
                 'Region': {
                     'X1': int(MonitorWidth * 0.40),
                     'Y1': int(MonitorHeight * 0.67),
@@ -299,8 +241,6 @@ class ConfigurationManager:
                     'Y2': int(MonitorHeight * 0.84)
                 }
             },
-            'BaitRecipes': [],
-            'CurrentRecipeIndex': 0
         }
     
     def LoadFromDisk(self):
@@ -369,58 +309,32 @@ class ConfigurationManager:
                 Fruit = ClickPoints["DevilFruit"]
                 self.Settings['ClickPoints']['StoreFruit'] = Fruit.get("StoreFruitPoint", None)
                 self.Settings['ClickPoints']['BackpackLocations'] = Fruit.get("BackpackLocations", [])
-            
-            if "Crafting" in ClickPoints:
-                Craft = ClickPoints["Crafting"]
-                self.Settings['ClickPoints']['CraftLeft'] = Craft.get("CraftLeftPoint", None)
-                self.Settings['ClickPoints']['CraftMiddle'] = Craft.get("CraftMiddlePoint", None)
-                self.Settings['ClickPoints']['CraftButton'] = Craft.get("CraftButtonPoint", None)
-                self.Settings['ClickPoints']['CraftConfirm'] = Craft.get("CraftConfirmPoint", None)
-                self.Settings['ClickPoints']['CloseMenu'] = Craft.get("CloseMenuPoint", None)
-                self.Settings['ClickPoints']['AddRecipe'] = Craft.get("AddRecipePoint", None)
-                self.Settings['ClickPoints']['TopRecipe'] = Craft.get("TopRecipePoint", None)
-                self.Settings['ClickPoints']['SellLeft'] = Craft.get("SellLeftPoint", None)
-                self.Settings['ClickPoints']['SellMiddle'] = Craft.get("SellMiddlePoint", None)
-                self.Settings['ClickPoints']['SellSelectTop'] = Craft.get("SellSelectTopPoint", None)
-                self.Settings['ClickPoints']['SellAccept'] = Craft.get("SellAcceptPoint", None)
-                self.Settings['ClickPoints']['SellClose'] = Craft.get("SellClosePoint", None)
-                self.Settings['BaitRecipes'] = Craft.get("BaitRecipes", [])
-                self.Settings['CurrentRecipeIndex'] = Craft.get("CurrentRecipeIndex", 0)
-        
+
         if "InventoryHotkeys" in LoadedData:
             Inv = LoadedData["InventoryHotkeys"]
             self.Settings['InventoryHotkeys']['Rod'] = Inv.get("RodHotkey", '1')
             self.Settings['InventoryHotkeys']['Alternate'] = Inv.get("AnythingElseHotkey", '2')
             self.Settings['InventoryHotkeys']['DevilFruits'] = Inv.get("DevilFruitHotkeys", ['3'])
-            self.Settings['InventoryHotkeys']['PotionBrewSlot'] = Inv.get("PotionBrewSlot", '4')
-        
+
         if "AutomationFeatures" in LoadedData:
             Auto = LoadedData["AutomationFeatures"]
             self.Settings['AutomationFeatures']['AutoBuyBait'] = Auto.get("AutoBuyCommonBait", False)
-            self.Settings['AutomationFeatures']['AutoCraftBait'] = Auto.get("AutoCraftBait", False)
             self.Settings['AutomationFeatures']['AutoStoreFruit'] = Auto.get("AutoStoreDevilFruit", False)
             self.Settings['AutomationFeatures']['StoreOnlyWhenDetected'] = Auto.get("StoreOnlyWhenDetected", True)
             self.Settings['AutomationFeatures']['AutoSelectTopBait'] = Auto.get("AutoSelectTopBait", False)
             self.Settings['AutomationFeatures']['SmartBaitSelect'] = Auto.get("SmartBaitSelect", False)
-            self.Settings['AutomationFeatures']['AutoSellFish'] = Auto.get("AutoSellFish", False)
-            self.Settings['AutomationFeatures']['AutoUsePotionBrew'] = Auto.get("AutoUsePotionBrew", False)
-        
+
         if "AutomationFrequencies" in LoadedData:
             Freq = LoadedData["AutomationFrequencies"]
             self.Settings['AutomationFrequencies']['LoopsPerTopBait'] = Freq.get("LoopsPerTopBait", 1)
             self.Settings['AutomationFrequencies']['LoopsPerPurchase'] = Freq.get("LoopsPerPurchase", 100)
             self.Settings['AutomationFrequencies']['LoopsPerStore'] = Freq.get("LoopsPerStore", 50)
             self.Settings['AutomationFrequencies']['FruitSweepLoops'] = Freq.get("FruitSweepLoops", 25)
-            self.Settings['AutomationFrequencies']['LoopsPerCraft'] = Freq.get("LoopsPerCraft", 5)
-            self.Settings['AutomationFrequencies']['CraftsPerCycle'] = Freq.get("CraftsPerCycle", 40)
-            self.Settings['AutomationFrequencies']['FishCountPerCraft'] = Freq.get("FishCountPerCraft", 50)
-            self.Settings['AutomationFrequencies']['SellRepeatCount'] = Freq.get("SellRepeatCount", 3)
-            self.Settings['AutomationFrequencies']['LoopsPerSell'] = Freq.get("LoopsPerSell", 50)
-            self.Settings['AutomationFrequencies']['PotionBrewIntervalMinutes'] = Freq.get("PotionBrewIntervalMinutes", 30)
 
         if "DevilFruitStorage" in LoadedData:
             Df = LoadedData["DevilFruitStorage"]
             self.Settings['DevilFruitStorage']['StoreToBackpack'] = Df.get("StoreToBackpack", False)
+            self.Settings['DevilFruitStorage']['DropUnstorable'] = Df.get("DropUnstorable", False)
             self.Settings['DevilFruitStorage']['WebhookUrl'] = Df.get("WebhookUrl", '')
         
         if "LoggingOptions" in LoadedData:
@@ -441,41 +355,15 @@ class ConfigurationManager:
                 'LogErrors': Log.get("LogErrors", True),
                 'PingErrors': Log.get("PingErrors", False)
             })
-        
-        if "SpawnDetection" in LoadedData:
-            Spawn = LoadedData["SpawnDetection"]
-            self.Settings['SpawnDetection'].update({
-                'EnableSpawnDetection': Spawn.get("EnableSpawnDetection", False),
-                'ScanInterval': Spawn.get("ScanInterval", 5.0),
-                'LogSpawns': Spawn.get("LogSpawns", True),
-                'PingSpawns': Spawn.get("PingSpawns", False)
-            })
 
         if "FishingModes" in LoadedData:
             Modes = LoadedData["FishingModes"]
             self.Settings['FishingModes']['MegalodonSound'] = Modes.get("MegalodonSound", False)
             self.Settings['FishingModes']['SoundSensitivity'] = Modes.get("SoundSensitivity", 0.1)
-        
-        if "RDPSettings" in LoadedData:
-            Rdp = LoadedData["RDPSettings"]
-            self.Settings['RDPSettings'].update({
-                'AutoDetectRDP': Rdp.get("AutoDetectRDP", True),
-                'AllowRDPExecution': Rdp.get("AllowRDPExecution", True),
-                'PauseOnRDPDisconnect': Rdp.get("PauseOnRDPDisconnect", True),
-                'ResumeOnRDPReconnect': Rdp.get("ResumeOnRDPReconnect", False)
-            })
-        
-        if "DeviceSyncSettings" in LoadedData:
-            Sync = LoadedData["DeviceSyncSettings"]
-            self.Settings['DeviceSyncSettings'].update({
-                'EnableDeviceSync': Sync.get("EnableDeviceSync", False),
-                'SyncSettings': Sync.get("SyncSettings", True),
-                'SyncStats': Sync.get("SyncStats", True),
-                'ShareFishCount': Sync.get("ShareFishCount", False),
-                'SyncIntervalSeconds': Sync.get("SyncIntervalSeconds", 5),
-                'DeviceName': Sync.get("DeviceName", "")
-            })
-        
+
+        if "AudioDevice" in LoadedData:
+            self.Settings['AudioDevice'].update(LoadedData["AudioDevice"])
+
         if "FishingControl" in LoadedData:
             Control = LoadedData["FishingControl"]
             if "PdController" in Control:
@@ -487,7 +375,7 @@ class ConfigurationManager:
         
         if "TimingDelays" in LoadedData:
             Timing = LoadedData["TimingDelays"]
-            for Category in ['RobloxWindow', 'PreCast', 'Inventory', 'DevilFruitStorage', 'AntiDetection', 'Crafting', 'PotionBrew']:
+            for Category in ['RobloxWindow', 'PreCast', 'Inventory', 'DevilFruitStorage', 'AntiDetection']:
                 if Category in Timing:
                     self.Settings['TimingDelays'][Category].update(Timing[Category])
         
@@ -519,27 +407,10 @@ class ConfigurationManager:
                         "StoreFruitPoint": self.Settings['ClickPoints']['StoreFruit'],
                         "BackpackLocations": self.Settings['ClickPoints']['BackpackLocations'],
                     },
-                    "Crafting": {
-                        "CraftLeftPoint": self.Settings['ClickPoints']['CraftLeft'],
-                        "CraftMiddlePoint": self.Settings['ClickPoints']['CraftMiddle'],
-                        "CraftButtonPoint": self.Settings['ClickPoints']['CraftButton'],
-                        "CraftConfirmPoint": self.Settings['ClickPoints']['CraftConfirm'],
-                        "CloseMenuPoint": self.Settings['ClickPoints']['CloseMenu'],
-                        "AddRecipePoint": self.Settings['ClickPoints']['AddRecipe'],
-                        "TopRecipePoint": self.Settings['ClickPoints']['TopRecipe'],
-                        "SellLeftPoint": self.Settings['ClickPoints']['SellLeft'],
-                        "SellMiddlePoint": self.Settings['ClickPoints']['SellMiddle'],
-                        "SellSelectTopPoint": self.Settings['ClickPoints']['SellSelectTop'],
-                        "SellAcceptPoint": self.Settings['ClickPoints']['SellAccept'],
-                        "SellClosePoint": self.Settings['ClickPoints']['SellClose'],
-                        "BaitRecipes": self.Settings['BaitRecipes'],
-                        "CurrentRecipeIndex": self.Settings['CurrentRecipeIndex']
-                    }
                 },
                 "InventoryHotkeys": {
                     "RodHotkey": self.Settings['InventoryHotkeys']['Rod'],
                     "AnythingElseHotkey": self.Settings['InventoryHotkeys']['Alternate'],
-                    "PotionBrewSlot": self.Settings['InventoryHotkeys']['PotionBrewSlot'],
                     "DevilFruitHotkeys": self.Settings['InventoryHotkeys']['DevilFruits']
                 },
                 "AutomationFeatures": {
@@ -548,26 +419,24 @@ class ConfigurationManager:
                     "StoreOnlyWhenDetected": self.Settings['AutomationFeatures']['StoreOnlyWhenDetected'],
                     "AutoSelectTopBait": self.Settings['AutomationFeatures']['AutoSelectTopBait'],
                     "SmartBaitSelect": self.Settings['AutomationFeatures']['SmartBaitSelect'],
-                    "AutoUsePotionBrew": self.Settings['AutomationFeatures']['AutoUsePotionBrew'],
-                    "AutoCraftBait": self.Settings['AutomationFeatures']['AutoCraftBait'],
-                    "AutoSellFish": self.Settings['AutomationFeatures']['AutoSellFish'],
                 },
                 "AutomationFrequencies": self.Settings['AutomationFrequencies'],
                 "DevilFruitStorage": self.Settings['DevilFruitStorage'],
                 "LoggingOptions": self.Settings['LoggingOptions'],
                 "FishingModes": self.Settings['FishingModes'],
-                "RDPSettings": self.Settings['RDPSettings'],
-                "DeviceSyncSettings": self.Settings['DeviceSyncSettings'],
+                "AudioDevice": self.Settings['AudioDevice'],
                 "FishingControl": self.Settings['FishingControl'],
                 "TimingDelays": self.Settings['TimingDelays'],
-                "SpawnDetection": self.Settings['SpawnDetection'],
                 "OCRSettings": self.Settings['OCRSettings'],
                 "BaitSelector": self.Settings['BaitSelector'],
             }
-            
-            with open(self.ConfigPath, 'w') as ConfigFile:
+
+            # Write-then-rename so a crash mid-save can't leave a truncated settings file
+            TempPath = self.ConfigPath + ".tmp"
+            with open(TempPath, 'w', encoding='utf-8') as ConfigFile:
                 json.dump(OutputData, ConfigFile, indent=4)
-                
+            os.replace(TempPath, self.ConfigPath)
+
         except Exception as SaveError:
             print(f"Error saving settings: {SaveError}")
 
@@ -577,33 +446,40 @@ class MacroStateManager:
     def __init__(self):
         self.IsRunning = False
         self.CurrentStatus = "Idle"
-        self.ClientId = str(uuid.uuid4())
-        
+
         self.TotalFishCaught = 0
         self.TotalDevilFruits = 0
         self.DevilFruitsByRarity = dict.fromkeys(FruitRarityOrder + ["Unknown"], 0)
         self.LastDevilFruit = None
-        # Fruits counted at catch time that the store cycle hasn't handled yet, so storing them doesn't count twice
-        self.FruitsCountedBeforeStore = []
+        # Every fruit counted this session, newest last, for the dashboard history
+        self.FruitHistory = []
+        # Catch scans run on their own threads; counting under a lock keeps two scans of one popup from both counting
+        self.FruitLock = Lock()
         # Set when the catch-time scan sees a fruit; the next pre-cast stores it
         self.FruitPendingStore = False
-        self.LastCaughtFruitTime = 0
         self.CumulativeUptime = 0
         self.SessionStartTime = None
         self.LastFishCaptureTime = None
-        self.LastPotionBrewTime = None
 
         self.TotalRecastTimeouts = 0
         self.ConsecutiveRecastTimeouts = 0
         self.LastPeriodicStatsTime = None
         self.FishAtLastStats = 0
-        
+
         self.BaitPurchaseCounter = 0
         self.FruitStorageCounter = 0
-        self.FishSinceLastCraft = 0
-        self.BaitCraftCounter = 0
         self.TopBaitCounter = 0
-        self.SellCounter = 0
+
+        # Bumped on every start; a macro loop exits once its token is stale
+        self.LoopId = 0
+        # Bumped on every catch; an older catch scan still running stops so only one OCR scan competes for CPU
+        self.FruitScanId = 0
+        # The last counted drop banner, to tell a lingering banner from a new drop
+        self.LastFruitDrop = None
+        # (name, time) of the last "New Item <Fruit>" applied to the history, since that popup lingers across scans
+        self.LastNamedFruit = (None, 0)
+        # Hotbar slots whose fruit the game refused to store (duplicates); skipped until the macro restarts
+        self.UnstorableSlots = set()
 
         # Smart bait tracking: remaining is decremented per cast and triggers a rescan at zero
         self.SelectedBait = None
@@ -622,45 +498,50 @@ class MacroStateManager:
         self.LastScanTime = time.time()
         self.LastStateChangeTime = time.time()
         self.LastInputResendTime = time.time()
-        
-        self.SessionLock = Lock()
-        
-        self.ClientStats = {}
-        self.GlobalStats = {
-            "TotalFishCaught": 0,
-            "TotalUptime": 0,
-            "ActiveClients": 0
-        }
-        
-        self.RDPDetected = False
-        self.RDPSessionState = 'unknown'
-        self.RDPSessionId = -1
-        
-        self.ConnectedDevices = []
-        self.IsSyncing = False
-    
+
     def UpdateStatus(self, Status):
         if Status != self.CurrentStatus:
             LogLine(f"STATUS {Status}")
         self.CurrentStatus = Status
-    
+
     def IncrementFishCount(self):
         self.TotalFishCaught += 1
-        self.FishSinceLastCraft += 1
         self.LastFishCaptureTime = time.time()
 
-    def IncrementDevilFruitCount(self, FruitName=None):
-        Rarity = FruitRarities.get(FruitName, "Unknown")
+    def IncrementDevilFruitCount(self, FruitName=None, Rarity=None, Pity=None):
+        Rarity = Rarity or FruitRarities.get(FruitName, "Unknown")
         self.TotalDevilFruits += 1
-        self.DevilFruitsByRarity[Rarity] += 1
-        self.LastDevilFruit = {"name": FruitName or "Unknown", "rarity": Rarity}
+        self.DevilFruitsByRarity[Rarity] = self.DevilFruitsByRarity.get(Rarity, 0) + 1
+        self.FruitHistory.append({
+            "name": FruitName or "Unknown",
+            "rarity": Rarity,
+            "pity": Pity,
+            "time": datetime.now().strftime('%H:%M:%S'),
+            "timestamp": time.time(),
+            "catch": self.TotalFishCaught,
+        })
+        del self.FruitHistory[:-50]
+        self.LastDevilFruit = self.FruitHistory[-1]
         return Rarity
+
+    def UpdateFruit(self, Entry, Name=None, Rarity=None):
+        # Fill in a counted drop once more is known (its name from a later popup, or a pity reset read late),
+        # moving it between rarity buckets without changing the total
+        if Rarity and Rarity != Entry['rarity']:
+            self.DevilFruitsByRarity[Entry['rarity']] = max(self.DevilFruitsByRarity.get(Entry['rarity'], 0) - 1, 0)
+            self.DevilFruitsByRarity[Rarity] = self.DevilFruitsByRarity.get(Rarity, 0) + 1
+            Entry['rarity'] = Rarity
+        if Name:
+            Entry['name'] = Name
 
     def ResetDevilFruitCounts(self):
         self.TotalDevilFruits = 0
         self.DevilFruitsByRarity = dict.fromkeys(self.DevilFruitsByRarity, 0)
         self.LastDevilFruit = None
-        self.FruitsCountedBeforeStore = []
+        self.FruitHistory = []
+        self.FruitPendingStore = False
+        self.LastFruitDrop = None
+        self.LastNamedFruit = (None, 0)
     
     def HandleRecastTimeout(self):
         self.TotalRecastTimeouts += 1
@@ -689,45 +570,13 @@ class MacroStateManager:
         return 0.0
 
 
-class RDPDetector:
-    
-    @staticmethod
-    def DetectRDPSession():
-        try:
-            SessionId = win32ts.WTSGetActiveConsoleSessionId()
-            ServerHandle = win32ts.WTS_CURRENT_SERVER_HANDLE
-            SessionInfo = win32ts.WTSQuerySessionInformation(
-                ServerHandle, 
-                SessionId, 
-                win32ts.WTSClientProtocolType
-            )
-            IsRdp = (SessionInfo == 2)
-            ConnectionState = win32ts.WTSQuerySessionInformation(
-                ServerHandle,
-                SessionId,
-                win32ts.WTSConnectState
-            )
-            RdpState = 'connected' if ConnectionState == 0 else 'disconnected'
-            
-            SessionName = win32ts.WTSQuerySessionInformation(
-                ServerHandle,
-                SessionId,
-                win32ts.WTSWinStationName
-            )
-            
-            return IsRdp, RdpState, SessionId, SessionName
-        except Exception as E:
-            print(f"RDP detection error: {E}")
-            return False, 'unknown', -1, 'unknown'
-
-
 class OCRManager:
     
     def __init__(self):
         self.Reader = None
         self.Enabled = True
         self.Loading = False
-        # Spawn detection runs on its own thread, so serialize readtext calls on the shared reader
+        # Catch scans and the bait scan run on different threads, so serialize readtext calls on the shared reader
         self.Lock = Lock()
 
     def Initialize(self):
@@ -750,24 +599,25 @@ class OCRManager:
                     except Exception as E:
                         print(f"OCR Initialization Error: {E}")
                         self.Enabled = False
-                
+                    finally:
+                        # Lets a later Initialize retry, e.g. after fast mode turned OCR back on
+                        self.Loading = False
+
                 threading.Thread(target=LoadOCR, daemon=True).start()
             except Exception as E:
                 print(f"OCR Thread Error: {E}")
                 self.Enabled = False
-    
+                self.Loading = False
+
     def IsReady(self):
         return self.Enabled and self.Reader is not None
 
     def WaitForInitialization(self, TimeoutSeconds=30):
+        # A slow first load (model download) must not switch OCR off for the whole session; just skip this scan
         StartTime = time.time()
-        while self.Reader is None and (time.time() - StartTime) < TimeoutSeconds:
+        while self.Reader is None and self.Enabled and (time.time() - StartTime) < TimeoutSeconds:
             time.sleep(0.5)
-        
-        if self.Reader is None:
-            self.Enabled = False
-            return False
-        return True
+        return self.Reader is not None
 
 
 FruitRarityOrder = ["Common", "Rare", "Epic", "Legendary", "Mythical"]
@@ -784,178 +634,130 @@ FruitRarities = {
 
 
 class DevilFruitDetector:
+    # Reads GPO's on-screen notices after a catch. A fruit drop shows
+    #   "All Seeing Eye: YOU GOT A DEVIL FRUIT DROP, CHECK YOUR BACKPACK!" / "LEGENDARY PITY: 10/40"
+    # and the fruit goes straight to the backpack. That banner is the only thing counted. "New Item <Name>" is shown
+    # for fish too (and for fruits when they are stored), so it only ever supplies a name for a counted drop
+
+    ItemPattern = re.compile(r'\b(?:new|nev|ncv|ncw|naw|ner)\s*[:;,.]?\s*(?:item|ltem|itcm|ltcm|iten|lten)\b(.*)', re.IGNORECASE)
+    # "12/40", "4/4O", "2/L0", "9/O"; OCR often reads the colon after PITY as a symbol
+    PityPattern = re.compile(r'P[A-Za-z]{0,3}Y[^A-Za-z0-9]{0,3}(\d{1,2})\s*/\s*[4AL]?\s*[0Oo]\b')
+    # A reset reads worst ("0lo", "0Lo", "040"), and it's the one that tells a legendary drop apart
+    PityZeroPattern = re.compile(r'P[A-Za-z]{0,3}Y[^A-Za-z0-9]{0,3}0\s*[/lLI]?\s*[4AL]?[0Oo]\b')
 
     def __init__(self, OcrManager, Config):
         self.OcrManager = OcrManager
         self.Config = Config
-        self.KnownFruits = set(FruitRarities)
-        # Raw OCR text and capture from the last DetectNewItem call, for diagnosing missed fruits
+        self.FruitNames = {Name.lower(): Name for Name in FruitRarities}
+        # Raw OCR text and capture from the last ReadRegion call, for diagnosing missed fruits
         self.LastRawText = ""
         self.LastScanImage = None
-    
-    def DetectNewItem(self):
-        try:
-            if self.OcrManager.Reader is None:
-                if not self.OcrManager.Enabled:
-                    return None
-                self.OcrManager.Initialize()
-                if not self.OcrManager.WaitForInitialization():
-                    return None
 
-            ScanRegion = {
-                "top": self.Config.Settings['OCRSettings']['Y1'],
-                "left": self.Config.Settings['OCRSettings']['X1'],
-                "width": self.Config.Settings['OCRSettings']['X2'] - self.Config.Settings['OCRSettings']['X1'],
-                "height": self.Config.Settings['OCRSettings']['Y2'] - self.Config.Settings['OCRSettings']['Y1']
-            }
-
-            with mss.mss() as ScreenCapture:
-                Screenshot = ScreenCapture.grab(ScanRegion)
-                Image = np.array(Screenshot)
-
-            ImageRGB = Image[:, :, [2, 1, 0]]
-
-            Img = PILImage.fromarray(ImageRGB)
-            W, H = Img.size
-            Img = Img.resize((W * 3, H * 3), PILImage.LANCZOS)
-            ImgCV = np.array(Img)
-            # Brightest channel instead of luminance, so rarity-coloured names (red, purple, blue) survive the threshold
-            Gray = ImgCV.max(axis=2).astype(np.uint8)
-            _, WhiteOnly = cv2.threshold(Gray, 180, 255, cv2.THRESH_BINARY)
-            Kernel = np.ones((2, 2), np.uint8)
-            Dilated = cv2.dilate(WhiteOnly, Kernel, iterations=1)
-            ProcessedImage = cv2.cvtColor(Dilated, cv2.COLOR_GRAY2RGB)
-
-            with self.OcrManager.Lock:
-                Results = self.OcrManager.Reader.readtext(
-                    ProcessedImage,
-                    detail=1,
-                    paragraph=True,
-                    text_threshold=0.6,
-                    contrast_ths=0.1,
-                    adjust_contrast=0.8,
-                    blocklist='@#$%^&*()+=[]{}|\\~`',
-                )
-
-            # paragraph=True makes easyocr return (box, text) without a confidence score
-            FullText = " ".join(R[1] for R in Results if len(R) < 3 or R[2] > 0.4)
-            FullText = FullText.strip()
-            FullTextLower = FullText.lower()
-            self.LastRawText = FullText
-            self.LastScanImage = ImageRGB
-
-            HasNew = any(Keyword in FullTextLower for Keyword in [
-                'new', 'nev', 'ncv', 'ncw', 'naw', 'ner'
-            ])
-            HasItem = 'item' in FullTextLower or 'ltem' in FullTextLower
-
-            if not (FullText and HasNew and HasItem):
+    def ReadRegion(self):
+        # OCR the Fruit Detection Area; returns the text, or None when OCR is unavailable
+        if self.OcrManager.Reader is None:
+            if not self.OcrManager.Enabled:
+                return None
+            self.OcrManager.Initialize()
+            if not self.OcrManager.WaitForInitialization():
                 return None
 
-            BracketMatch = re.search(r'[<(\[{]([A-Za-z]+)[>\)\]}]?', FullText)
-            if BracketMatch:
-                Candidate = BracketMatch.group(1).strip()
-                if len(Candidate) >= 3:
-                    ClosestMatch = self.GetClosestFruit(Candidate, Cutoff=0.55)
-                    if ClosestMatch:
-                        return ClosestMatch
+        Region = self.Config.Settings['OCRSettings']
+        ScanRegion = {
+            "top": Region['Y1'],
+            "left": Region['X1'],
+            "width": Region['X2'] - Region['X1'],
+            "height": Region['Y2'] - Region['Y1']
+        }
 
-            AfterItemMatch = re.search(r'(?:item|ltem)\s+(.+)', FullText, re.IGNORECASE)
-            if AfterItemMatch:
-                Remainder = AfterItemMatch.group(1).strip()
-                Remainder = re.sub(r'[<>(\[{\])}?]', '', Remainder).strip()
-                Words = Remainder.split()
-                for Word in Words:
-                    if len(Word) >= 3:
-                        ClosestMatch = self.GetClosestFruit(Word, Cutoff=0.55)
-                        if ClosestMatch:
-                            return ClosestMatch
+        with mss.mss() as ScreenCapture:
+            Image = np.array(ScreenCapture.grab(ScanRegion))
 
+        ImageRGB = Image[:, :, [2, 1, 0]]
+        Upscaled = cv2.resize(ImageRGB, None, fx=3, fy=3, interpolation=cv2.INTER_LANCZOS4)
+        # Brightest channel instead of luminance, so rarity-coloured text (red, purple, blue) survives the threshold
+        Gray = Upscaled.max(axis=2).astype(np.uint8)
+        _, WhiteOnly = cv2.threshold(Gray, 180, 255, cv2.THRESH_BINARY)
+        Dilated = cv2.dilate(WhiteOnly, np.ones((2, 2), np.uint8), iterations=1)
+        ProcessedImage = cv2.cvtColor(Dilated, cv2.COLOR_GRAY2RGB)
+
+        with self.OcrManager.Lock:
+            Results = self.OcrManager.Reader.readtext(
+                ProcessedImage,
+                detail=1,
+                paragraph=True,
+                text_threshold=0.6,
+                contrast_ths=0.1,
+                adjust_contrast=0.8,
+                blocklist='@#$%^&*()+=[]{}|\\~`',
+            )
+
+        # paragraph=True makes easyocr return (box, text) without a confidence score
+        FullText = " ".join(R[1] for R in Results if len(R) < 3 or R[2] > 0.4).strip()
+        self.LastRawText = FullText
+        self.LastScanImage = ImageRGB
+        return FullText
+
+    def ParseNotices(self, FullText):
+        # Returns {'Drop': bool, 'Pity': int or None, 'ItemFruit': fruit name or None}
+        Drop, Pity = self.MatchDropBanner(FullText)
+        ItemMatch = self.ItemPattern.search(FullText)
+        return {
+            'Drop': Drop,
+            'Pity': Pity,
+            'ItemFruit': self.MatchItemName(ItemMatch.group(1)) if ItemMatch else None,
+        }
+
+    def MatchDropBanner(self, FullText):
+        # Returns (Found, Pity). OCR garbles the banner heavily ("YOUGOTADEWL ERWT DROP; CHCKYoUR BACKACk"), so
+        # look for DROP preceded by letters resembling DEVILFRUIT. DROPPED is the unrelated
+        # "You can only store one of each fruit! Dropped Bomb will despawn" message
+        Compact = re.sub(r'[^A-Z]', '', FullText.upper())
+        for Match in re.finditer(r'DROP(?!PED)', Compact):
+            Before = Compact[max(Match.start() - 12, 0):Match.start()]
+            if any(SequenceMatcher(None, Before[-Length:], 'DEVILFRUIT').ratio() >= 0.6 for Length in range(6, 13)):
+                break
+        else:
+            return False, None
+
+        # The pity line sits under the banner, so only read after it (the stats overlay above holds other numbers)
+        After = re.split(r'drop(?!ped)', FullText, flags=re.IGNORECASE)[-1]
+        PityMatch = self.PityPattern.search(After)
+        if PityMatch:
+            return True, int(PityMatch.group(1))
+        if self.PityZeroPattern.search(After):
+            return True, 0
+        return True, None
+
+    def MatchItemName(self, Remainder):
+        # "<Pika>" -> "Pika". Fish have multi-word names ("<Zebra Ribbon Angelfish>"), and loosely matching one of
+        # those words ("zebra" ~ "Mera") is what counted fish as fruits, so require one word and a close match
+        # The store notice ("... You can only store one of each fruit!") often follows without a closing bracket
+        Name = re.split(r'[>)\]}]|\byou\b', Remainder.strip().lstrip('<([{ :;,.'), maxsplit=1, flags=re.IGNORECASE)[0]
+        Words = re.findall(r'[A-Za-z]+', Name)
+        if len(Words) != 1 or not 3 <= len(Words[0]) <= 12:
             return None
+        Word = Words[0].lower()
+        # OCR reads the angle brackets as a stray letter ("sKage", "zPikaz"); only those letters are trimmed, so a
+        # real word like "Sunken" can't be cut down to "Suke"
+        Candidates = {Word}
+        if Word[0] in 'zsc':
+            Candidates.add(Word[1:])
+        if Word[-1] in 'zsp':
+            Candidates |= {C[:-1] for C in Candidates}
+        Best, BestRatio = None, 0.0
+        for Candidate in Candidates:
+            if len(Candidate) < 3:
+                continue
+            for Lower, Proper in self.FruitNames.items():
+                Ratio = SequenceMatcher(None, Candidate, Lower).ratio()
+                if Ratio > BestRatio:
+                    Best, BestRatio = Proper, Ratio
+        return Best if BestRatio >= 0.8 else None
 
-        except Exception as E:
-            print(f"OCR Check Error: {E}")
-            traceback.print_exc()
-            return None
-    
-    def DetectSpawn(self):
-        try:
-            if self.OcrManager.Reader is None:
-                if not self.OcrManager.Enabled:
-                    return None
-                self.OcrManager.Initialize()
-                if not self.OcrManager.WaitForInitialization():
-                    return None
 
-            ScanRegion = {
-                "top": self.Config.Settings['OCRSettings']['Y1'],
-                "left": self.Config.Settings['OCRSettings']['X1'],
-                "width": self.Config.Settings['OCRSettings']['X2'] - self.Config.Settings['OCRSettings']['X1'],
-                "height": self.Config.Settings['OCRSettings']['Y2'] - self.Config.Settings['OCRSettings']['Y1']
-            }
-
-            with mss.mss() as ScreenCapture:
-                Screenshot = ScreenCapture.grab(ScanRegion)
-                Image = np.array(Screenshot)
-
-            ImageRGB = Image[:, :, [2, 1, 0]]
-
-            Img = PILImage.fromarray(ImageRGB)
-            W, H = Img.size
-            Img = Img.resize((W * 3, H * 3), PILImage.LANCZOS)
-            ImgCV = np.array(Img)
-            Gray = cv2.cvtColor(ImgCV, cv2.COLOR_RGB2GRAY)
-            _, WhiteOnly = cv2.threshold(Gray, 180, 255, cv2.THRESH_BINARY)
-            Kernel = np.ones((2, 2), np.uint8)
-            Dilated = cv2.dilate(WhiteOnly, Kernel, iterations=1)
-            ProcessedImage = cv2.cvtColor(Dilated, cv2.COLOR_GRAY2RGB)
-
-            with self.OcrManager.Lock:
-                Results = self.OcrManager.Reader.readtext(
-                    ProcessedImage,
-                    detail=1,
-                    paragraph=True,
-                    text_threshold=0.6,
-                    contrast_ths=0.1,
-                    adjust_contrast=0.8,
-                    blocklist='@#$%^&*()+=[]{}|\\~`',
-                )
-
-            # paragraph=True makes easyocr return (box, text) without a confidence score
-            FullText = " ".join(R[1] for R in Results if len(R) < 3 or R[2] > 0.4)
-            FullText = FullText.strip()
-            FullTextLower = FullText.lower()
-
-            HasSpawn = 'spawn' in FullTextLower
-
-            if not (FullText and HasSpawn):
-                return None
-
-            Words = FullText.split()
-            for Word in Words:
-                Clean = re.sub(r'[^A-Za-z]', '', Word)
-                if len(Clean) >= 3:
-                    Match = self.GetClosestFruit(Clean, Cutoff=0.6)
-                    if Match:
-                        return Match
-
-            return None
-
-        except Exception as E:
-            print(f"Spawn detection error: {E}")
-            traceback.print_exc()
-            return None
-        
-    def GetClosestFruit(self, Name, Cutoff=0.6):
-        Matches = get_close_matches(Name, self.KnownFruits, n=1, cutoff=Cutoff)
-        return Matches[0] if Matches else None
-
-    def IdentifyStoredFruit(self):
-        # OCR the "new item" popup after storing; returns a known fruit name or None
-        if not self.OcrManager.Enabled:
-            return None
-        RawDetection = self.DetectNewItem()
-        return self.GetClosestFruit(RawDetection, Cutoff=0.6) if RawDetection else None
+# What Auto Buy purchases from the bait shop
+ShopBaitName = 'Common Fish Bait'
 
 
 class BaitListReader:
@@ -1085,7 +887,6 @@ class WebhookNotifier:
             ColorSuccess = 0x10b981
             ColorWarning = 0xf59e0b
             ColorError = 0xef4444
-            ColorCraft = 0x8b5cf6
             ColorFruit = 0xbf40bf
             ColorStats = 0x3b82f6
             ColorMega = 0xfbbf24
@@ -1110,12 +911,6 @@ class WebhookNotifier:
                     Category = "devil_fruit"
                     ShouldSend = LogOpts['LogDevilFruit']
                     PingUser = LogOpts['PingDevilFruit']
-                elif "craft" in MessageLower:
-                    Color = ColorCraft
-                    Title = "🎣 Crafting Update"
-                    Category = "general"
-                    ShouldSend = LogOpts['LogGeneralUpdates']
-                    PingUser = LogOpts['PingGeneralUpdates']
                 elif "stats" in MessageLower or "caught:" in MessageLower or "total:" in MessageLower:
                     Color = ColorStats
                     Title = "🎣 Fishing Statistics"
@@ -1140,12 +935,6 @@ class WebhookNotifier:
                     Category = "recast_timeouts"
                     ShouldSend = LogOpts['LogRecastTimeouts']
                     PingUser = LogOpts['PingRecastTimeouts']
-                elif "reconnected" in MessageLower or "disconnected" in MessageLower or "rdp" in MessageLower:
-                    Color = ColorWarning
-                    Title = "🎣 RDP Status"
-                    Category = "general"
-                    ShouldSend = LogOpts['LogGeneralUpdates']
-                    PingUser = LogOpts['PingGeneralUpdates']
                 else:
                     Color = ColorInfo
                     Title = "🎣 GPO Fishing Macro"
@@ -1182,7 +971,15 @@ class WebhookNotifier:
             DiscordUserId = LogOpts['DiscordUserId']
             if PingUser and DiscordUserId and DiscordUserId.strip():
                 PayloadData["content"] = f"<@{DiscordUserId.strip()}>"
-            
+
+            # Callers include the fishing loop, which must not stall on a slow Discord response
+            threading.Thread(target=self.Post, args=(WebhookUrl, PayloadData), daemon=True).start()
+        except Exception as E:
+            print(f"Webhook error: {E}")
+
+    @staticmethod
+    def Post(WebhookUrl, PayloadData):
+        try:
             requests.post(WebhookUrl, json=PayloadData, timeout=5)
         except Exception as E:
             print(f"Webhook error: {E}")
@@ -1838,28 +1635,27 @@ class FishingMinigameController:
     def WaitForBobber(self):
         StartTime = time.time()
         BarFrames = 0
+        BlackScreenCount = 0
 
         ScanArea = self.Config.Settings['ScanArea']
         MaxTimeout = self.Config.Settings['FishingControl']['Timing']['RecastTimeout']
+        Capture = self.GetCapture()
 
         while self.State.IsRunning:
             Elapsed = time.time() - StartTime
-            
+
             if Elapsed >= MaxTimeout:
                 return False
-            
-            with mss.mss() as Capture:
-                Region = {
-                    "top": ScanArea["Y1"],
-                    "left": ScanArea["X1"],
-                    "width": ScanArea["X2"] - ScanArea["X1"],
-                    "height": ScanArea["Y2"] - ScanArea["Y1"]
-                }
-                Screenshot = Capture.grab(Region)
-                Image = np.array(Screenshot)
-            
+
+            Image = np.array(Capture.grab({
+                "top": ScanArea["Y1"],
+                "left": ScanArea["X1"],
+                "width": ScanArea["X2"] - ScanArea["X1"],
+                "height": ScanArea["Y2"] - ScanArea["Y1"]
+            }))
+
             if ColorDetector.DetectBlackScreen(ScanArea, Image, self.Config.Settings['FishingControl']['Detection']['BlackScreenThreshold']):
-                BlackScreenCount = BlackScreenCount + 1 if 'BlackScreenCount' in locals() else 1
+                BlackScreenCount += 1
                 if BlackScreenCount >= 3:
                     self.State.UpdateStatus("Multiple black screens detected - recasting")
                     return False
@@ -2042,8 +1838,13 @@ class FishingMinigameController:
 
         if Failure == 'no_blue_bar':
             self.Snapshot(Image, 'no_blue_bar')
+            FirstMiss = self.BarMissingSince is None
             Still = self.BarMissing(Now)
-            LogLine(f"MINIGAME blue bar not visible ({'waiting' if Still else 'ending minigame'})")
+            # The loop runs every few ms, so log only the transitions instead of every grace frame
+            if not Still:
+                LogLine(f"MINIGAME blue bar not visible for {Now - self.BarMissingSince:.2f}s (ending minigame)")
+            elif FirstMiss:
+                LogLine("MINIGAME blue bar not visible (waiting)")
             return Still
         self.BarMissingSince = None
 
@@ -2135,7 +1936,8 @@ class AutomatedFishingSystem:
             Handle = kernel32.OpenProcess(PROCESS_SET_INFORMATION, False, Pid)
             
             if Handle:
-                Result = kernel32.SetPriorityClass(Handle, 0x00000100)
+                # HIGH, not REALTIME: a realtime busy loop (the minigame) can starve Windows input handling as admin
+                Result = kernel32.SetPriorityClass(Handle, 0x00000080)
                 kernel32.CloseHandle(Handle)
                 
                 if not Result:
@@ -2174,76 +1976,11 @@ class AutomatedFishingSystem:
         self.FastMode = False
         
         self.CurrentlyRebindingHotkey = None
+        self.ToggleLock = Lock()
+        self.LoopThread = None
 
-        self.SpawnDetectionRunning = False
-        self.LastSpawnCheck = time.time()
-        
         self.RegisterHotkeys()
 
-        threading.Thread(target=self.SpawnDetectionLoop, daemon=True).start()
-    
-    def SpawnDetectionLoop(self):
-        while True:
-            try:
-                if not self.Config.Settings['SpawnDetection']['EnableSpawnDetection']:
-                    time.sleep(1)
-                    continue
-                
-                CurrentTime = time.time()
-                if CurrentTime - self.LastSpawnCheck < self.Config.Settings['SpawnDetection']['ScanInterval']:
-                    time.sleep(0.5)
-                    continue
-                
-                self.LastSpawnCheck = CurrentTime
-                
-                DetectedFruit = self.FruitDetector.DetectSpawn()
-                
-                if DetectedFruit:
-                    LogOpts = self.Config.Settings['SpawnDetection']
-                    if LogOpts['LogSpawns'] and self.Config.Settings['DevilFruitStorage']['WebhookUrl']:
-                        Message = f"Devil Fruit Spawned: {DetectedFruit}"
-                        
-                        PingUser = LogOpts['PingSpawns']
-                        
-                        EmbedData = {
-                            "title": "🍎 Devil Fruit Spawn Detected",
-                            "description": f"**{Message}**",
-                            "color": 0xbf40bf,
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "footer": {
-                                "text": "Macro Notification System",
-                                "icon_url": "https://cdn.discordapp.com/avatars/1351127835175288893/208dc6bfcc148a0c3ad2482b12520f43.webp"
-                            },
-                            "fields": [
-                                {
-                                    "name": "Time",
-                                    "value": f"<t:{int(time.time())}:R>",
-                                    "inline": True
-                                }
-                            ],
-                        }
-                        
-                        PayloadData = {
-                            "username": "K's GPO Macro Bot",
-                            "embeds": [EmbedData]
-                        }
-
-                        DiscordUserId = self.Config.Settings['LoggingOptions']['DiscordUserId']
-                        if PingUser and DiscordUserId and DiscordUserId.strip():
-                            PayloadData["content"] = f"<@{DiscordUserId.strip()}>"
-                        
-                        try:
-                            requests.post(self.Config.Settings['DevilFruitStorage']['WebhookUrl'], json=PayloadData, timeout=5)
-                        except Exception as E:
-                            print(f"Webhook error: {E}")
-                    
-                    time.sleep(5)
-                
-            except Exception as E:
-                print(f"Spawn detection loop error: {E}")
-                traceback.print_exc()
-                time.sleep(1)
-    
     def RegisterHotkeys(self):
         try:
             Hotkeys = self.Config.Settings['Hotkeys']
@@ -2253,53 +1990,49 @@ class AutomatedFishingSystem:
             print(f"Error setting up hotkeys: {E}")
     
     def ToggleMacro(self):
-        self.State.IsRunning = not self.State.IsRunning
-        
-        if self.Config.Settings['RDPSettings']['AutoDetectRDP']:
-            self.State.RDPDetected, self.State.RDPSessionState, self.State.RDPSessionId, RDPSessionName = RDPDetector.DetectRDPSession()
-        
-        if self.State.ClientId not in self.State.ClientStats:
-            self.State.ClientStats[self.State.ClientId] = {
-                "fish_caught": 0,
-                "start_time": None,
-                "last_seen": time.time(),
-                "rdp_detected": self.State.RDPDetected,
-                "rdp_state": self.State.RDPSessionState
-            }
-        
-        self.State.ClientStats[self.State.ClientId]["last_seen"] = time.time()
-        self.State.ClientStats[self.State.ClientId]["rdp_detected"] = self.State.RDPDetected
-        self.State.ClientStats[self.State.ClientId]["rdp_state"] = self.State.RDPSessionState
-        
-        if self.State.IsRunning:
-            self.State.UpdateStatus("Starting macro...")
-            self.State.SessionStartTime = time.time()
-            self.State.ClientStats[self.State.ClientId]["start_time"] = time.time()
-            self.State.ClientStats[self.State.ClientId]["fish_caught"] = self.State.TotalFishCaught
-            self.State.RobloxWindowFocused = False
-            self.State.RodEquipped = False
-            self.State.BaitRescanNeeded = True
-            self.State.ConsecutiveRecastTimeouts = 0
-            self.State.LastPeriodicStatsTime = time.time()
-            self.State.FishAtLastStats = self.State.TotalFishCaught
-            
-            if self.Config.Settings['DevilFruitStorage']['WebhookUrl'] and self.Config.Settings['LoggingOptions']['LogMacroState']:
-                self.Notifier.SendNotification("Macro started.")
-            
-            threading.Thread(target=self.ExecuteMacroLoop, daemon=True).start()
-        else:
-            self.State.UpdateStatus("Stopping macro...")
-            if self.State.SessionStartTime:
-                self.State.CumulativeUptime += time.time() - self.State.SessionStartTime
-                self.State.SessionStartTime = None
-            if self.State.MousePressed:
-                pyautogui.mouseUp()
-                self.State.MousePressed = False
-            
-            if self.Config.Settings['DevilFruitStorage']['WebhookUrl'] and self.Config.Settings['LoggingOptions']['LogMacroState']:
-                self.Notifier.SendNotification(f"Macro stopped. Fish this session: {self.State.TotalFishCaught} | Devil Fruits: {self.State.TotalDevilFruits}")
-            
-            self.State.UpdateStatus("Idle")
+        # The hotkey and the UI can both toggle; serialize so a double press can't start two loops
+        with self.ToggleLock:
+            self.State.IsRunning = not self.State.IsRunning
+
+            if self.State.IsRunning:
+                # After a quick stop/start the previous loop may still be finishing a step (every step checks
+                # IsRunning, so this is short). Retire it before setting up the new session so its exit can't
+                # close out the new session's timer; the token covers a loop that outlives the wait
+                if self.LoopThread and self.LoopThread.is_alive():
+                    self.State.IsRunning = False
+                    self.LoopThread.join(timeout=5)
+                self.State.LoopId += 1
+                self.State.IsRunning = True
+
+                self.State.UpdateStatus("Starting macro...")
+                self.State.SessionStartTime = time.time()
+                self.State.RobloxWindowFocused = False
+                self.State.RodEquipped = False
+                self.State.BaitRescanNeeded = True
+                self.State.ConsecutiveRecastTimeouts = 0
+                self.State.LastPeriodicStatsTime = time.time()
+                self.State.FishAtLastStats = self.State.TotalFishCaught
+                # The player may have cleared their hotbar while stopped
+                self.State.UnstorableSlots.clear()
+
+                if self.Config.Settings['DevilFruitStorage']['WebhookUrl'] and self.Config.Settings['LoggingOptions']['LogMacroState']:
+                    self.Notifier.SendNotification("Macro started.")
+
+                self.LoopThread = threading.Thread(target=self.ExecuteMacroLoop, args=(self.State.LoopId,), daemon=True)
+                self.LoopThread.start()
+            else:
+                self.State.UpdateStatus("Stopping macro...")
+                if self.State.SessionStartTime:
+                    self.State.CumulativeUptime += time.time() - self.State.SessionStartTime
+                    self.State.SessionStartTime = None
+                if self.State.MousePressed:
+                    pyautogui.mouseUp()
+                    self.State.MousePressed = False
+
+                if self.Config.Settings['DevilFruitStorage']['WebhookUrl'] and self.Config.Settings['LoggingOptions']['LogMacroState']:
+                    self.Notifier.SendNotification(f"Macro stopped. Fish this session: {self.State.TotalFishCaught} | Devil Fruits: {self.State.TotalDevilFruits}")
+
+                self.State.UpdateStatus("Idle")
     
     def ModifyScanArea(self):
         if self.RegionSelectorActive:
@@ -2396,21 +2129,14 @@ class AutomatedFishingSystem:
         pyautogui.mouseUp()
         return True
     
-    def ExecuteMacroLoop(self):
+    def ExecuteMacroLoop(self, LoopId):
         LastActivity = time.time()
         ErrorCount = 0
         MaxConsecutiveErrors = 5
-        
-        while self.State.IsRunning:
+
+        while self.State.IsRunning and LoopId == self.State.LoopId:
             try:
                 LastActivity = time.time()
-                
-                if self.Config.Settings['RDPSettings']['AutoDetectRDP']:
-                    self.State.RDPDetected, self.State.RDPSessionState, self.State.RDPSessionId, RDPSessionName = RDPDetector.DetectRDPSession()
-                    
-                    if self.State.ClientId in self.State.ClientStats:
-                        self.State.ClientStats[self.State.ClientId]['rdp_detected'] = self.State.RDPDetected
-                        self.State.ClientStats[self.State.ClientId]['rdp_state'] = self.State.RDPSessionState
 
                 self.State.UpdateStatus("Starting new fishing cycle")
                 LastActivity = time.time()
@@ -2513,6 +2239,7 @@ class AutomatedFishingSystem:
                             break
                 
                 if self.State.IsRunning:
+                    ErrorCount = 0
                     self.State.UpdateStatus("Fish caught successfully!")
                     self.State.IncrementFishCount()
                     threading.Thread(target=self.ScanForCaughtFruit, daemon=True).start()
@@ -2557,18 +2284,24 @@ class AutomatedFishingSystem:
                 self.State.RobloxWindowFocused = False
                 self.State.RodEquipped = False
                 continue
-        
+
+        # A newer loop owns the session now; closing out the timer here would stop its clock
+        if LoopId != self.State.LoopId:
+            return
+
+        # Ended by errors rather than the hotkey: flip the switch so the UI and a later F1 agree with reality
+        self.State.IsRunning = False
         if self.State.SessionStartTime:
             self.State.CumulativeUptime += time.time() - self.State.SessionStartTime
             self.State.SessionStartTime = None
-        
+
         if self.State.MousePressed:
             try:
                 pyautogui.mouseUp()
                 self.State.MousePressed = False
             except:
                 pass
-        
+
         self.State.UpdateStatus("Idle")
 
     def ExecutePreCast(self, ForcePreCast=False):
@@ -2594,20 +2327,7 @@ class AutomatedFishingSystem:
 
         if not self.State.IsRunning:
             return False
-        
-        if self.Config.Settings['AutomationFeatures']['AutoCraftBait']:
-            Points = self.Config.Settings['ClickPoints']
-            if all([Points['CraftLeft'], Points['CraftMiddle'], Points['CraftButton'], Points['CloseMenu'], Points['AddRecipe'], Points['TopRecipe'], len(self.Config.Settings['BaitRecipes']) > 0]):
-                if ForcePreCast or self.State.FishSinceLastCraft >= self.Config.Settings['AutomationFrequencies']['FishCountPerCraft']:
-                    self.ExecuteCraftingCycle()
-                    # Freshly crafted bait may outrank the current tier
-                    self.State.BaitRescanNeeded = True
-                    if not self.State.IsRunning:
-                        return False
-        
-        if not self.State.IsRunning:
-            return False
-        
+
         if self.Config.Settings['AutomationFeatures']['AutoBuyBait']:
             Points = self.Config.Settings['ClickPoints']
             if Points['ShopLeft'] and Points['ShopCenter'] and Points['ShopRight']:
@@ -2633,49 +2353,17 @@ class AutomatedFishingSystem:
                 self.State.FruitPendingStore = False
             else:
                 self.State.FruitStorageCounter += 1
-        
-        if not self.State.IsRunning:
-            return False
-        
-        if self.Config.Settings['AutomationFeatures']['AutoSellFish']:
-            Points = self.Config.Settings['ClickPoints']
-            if Points['SellLeft'] and Points['SellMiddle'] and Points['SellAccept']:
-                LoopsPerSell = self.Config.Settings['AutomationFrequencies']['LoopsPerSell']
-                if ForcePreCast or self.State.SellCounter == 0 or self.State.SellCounter >= LoopsPerSell:
-                    self.ExecuteSellCycle()
-                    if not self.State.IsRunning:
-                        return False
-                    self.State.SellCounter = 1
-                else:
-                    self.State.UpdateStatus(f"Skipping sell ({self.State.SellCounter}/{LoopsPerSell})")
-                    self.State.SellCounter += 1
 
         if not self.State.IsRunning:
             return False
-        
-        print("Checking potion brew conditions... step 1")
-        if self.Config.Settings["AutomationFeatures"]["AutoUsePotionBrew"]:
-            print("Checking potion brew conditions... step 2")
-            IntervalSeconds = self.Config.Settings['AutomationFrequencies']['PotionBrewIntervalMinutes'] * 60
-            Now = time.time()
 
-            print("Checking potion time: ", ForcePreCast, self.State.LastPotionBrewTime, Now - self.State.LastPotionBrewTime if self.State.LastPotionBrewTime else None, IntervalSeconds)
-
-            if ForcePreCast or self.State.LastPotionBrewTime is None or (Now - self.State.LastPotionBrewTime) >= IntervalSeconds:
-                print("Executing potion brew")
-                self.ExecutePotionBrew()
-                if not self.State.IsRunning:
-                    return False
-
-        # Bait goes last: the shop, fruit storage and selling all swap items, which undid an earlier pick
+        # Bait goes last: the shop and fruit storage both swap items, which undid an earlier pick
         if self.Config.Settings['AutomationFeatures']['AutoSelectTopBait'] and self.Config.Settings['AutomationFeatures']['SmartBaitSelect']:
             self.ExecuteSmartBaitSelect(ForcePreCast)
 
-        elif self.Config.Settings['AutomationFeatures']['AutoSelectTopBait']:
-            Points = self.Config.Settings['ClickPoints']
-            if not Points['Bait']:
-                return False
-
+        # Without a Top Bait Point there's nothing to click; fish with whatever bait is equipped instead of
+        # failing every pre-cast (which left the macro running but never casting)
+        elif self.Config.Settings['AutomationFeatures']['AutoSelectTopBait'] and self.Config.Settings['ClickPoints']['Bait']:
             LoopsPerTopBait = self.Config.Settings['AutomationFrequencies'].get('LoopsPerTopBait', 1)
             if ForcePreCast or self.State.TopBaitCounter == 0 or self.State.TopBaitCounter >= LoopsPerTopBait:
                 self.ExecuteSelectTopBait()
@@ -2703,126 +2391,6 @@ class AutomatedFishingSystem:
             return SweepLoops > 0 and Counter >= SweepLoops
         return Counter >= Freq['LoopsPerStore']
 
-    def ExecuteCraftingCycle(self):
-        self.State.UpdateStatus("Starting crafting cycle")
-        
-        Delays = self.Config.Settings['TimingDelays']['Crafting']
-        time.sleep(Delays['CraftMenuOpenDelay'])
-        
-        if Delays['MoveDuration'] < 0:
-            keyboard.press_and_release('shift')
-            time.sleep(0.1)
-            if not self.State.IsRunning:
-                return
-            
-            keyboard.press('d')
-            time.sleep(abs(Delays['MoveDuration']))
-            keyboard.release('d')
-            time.sleep(self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitShiftDelay'])
-            if not self.State.IsRunning:
-                return
-            
-            keyboard.press_and_release('shift')
-            time.sleep(0.1)
-            if not self.State.IsRunning:
-                return
-        
-        self.UnequipAll()
-        
-        self.State.UpdateStatus("Opening craft menu")
-        keyboard.press_and_release('t')
-        time.sleep(Delays['CraftMenuOpenDelay'])
-        if not self.State.IsRunning:
-            return
-        
-        Points = self.Config.Settings['ClickPoints']
-        self.InputController.ClickPoint(Points['CraftLeft'])
-        if not self.State.IsRunning:
-            return
-        
-        self.InputController.ClickPoint(Points['CraftMiddle'])
-        if not self.State.IsRunning:
-            return
-        
-        for RecipeIndex in range(len(self.Config.Settings['BaitRecipes'])):
-            self.State.UpdateStatus(f"Crafting recipe {RecipeIndex+1}/{len(self.Config.Settings['BaitRecipes'])}")
-            Recipe = self.Config.Settings['BaitRecipes'][RecipeIndex]
-            
-            if not Recipe.get('BaitRecipePoint'):
-                continue
-            
-            self.InputController.ClickPoint(Recipe['BaitRecipePoint'])
-            time.sleep(Delays['CraftRecipeSelectDelay'])
-            if not self.State.IsRunning:
-                return
-            
-            RecipeCycle = Recipe.get('SwitchFishCycle', 5)
-            SelectMaxPoint = Recipe.get('SelectMaxPoint')
-            
-            for FishIter in range(RecipeCycle):
-                if not self.State.IsRunning:
-                    return
-                
-                self.InputController.ClickPoint(Points['AddRecipe'])
-                time.sleep(Delays['CraftAddRecipeDelay'])
-                if not self.State.IsRunning:
-                    return
-                
-                self.InputController.ClickPoint(Points['TopRecipe'])
-                time.sleep(Delays['CraftTopRecipeDelay'])
-                if not self.State.IsRunning:
-                    return
-                
-                self.State.UpdateStatus(f"Opening craft dialog {FishIter+1}/{RecipeCycle}")
-                self.InputController.ClickPoint(Points['CraftButton'])
-                time.sleep(Delays['CraftButtonClickDelay'] + Delays['CraftClickDelay'])
-                if not self.State.IsRunning:
-                    return
-                
-                if SelectMaxPoint:
-                    self.State.UpdateStatus(f"Clicking Select Max for recipe {RecipeIndex+1}")
-                    self.InputController.ClickPoint(SelectMaxPoint)
-                    time.sleep(Delays['CraftClickDelay'])
-                    if not self.State.IsRunning:
-                        return
-                    
-                if Points['CraftConfirm']:
-                    self.InputController.ClickPoint(Points['CraftConfirm'])
-
-                self.State.UpdateStatus(f"Confirming craft batch {FishIter+1}/{RecipeCycle}")
-                time.sleep(Delays['CraftClickDelay'])     
-
-        self.State.UpdateStatus("Closing craft menu")
-        self.InputController.ClickPoint(Points['CloseMenu'])
-        time.sleep(Delays['CraftCloseMenuDelay'])
-        if not self.State.IsRunning:
-            return
-
-        if Delays['MoveDuration'] < 0: 
-            keyboard.press_and_release('shift')
-            time.sleep(0.1)
-            if not self.State.IsRunning:
-                return
-            
-            keyboard.press('a')
-            time.sleep(abs(Delays['MoveDuration']))
-            keyboard.release('a')
-            time.sleep(1.0)
-            if not self.State.IsRunning:
-                return
-            
-            keyboard.press_and_release('shift')
-            time.sleep(0.1)
-            if not self.State.IsRunning:
-                return
-        
-        self.State.FishSinceLastCraft = 0
-        self.State.UpdateStatus("Crafting complete")
-
-        LogOpts = self.Config.Settings['LoggingOptions']
-        if self.Config.Settings['DevilFruitStorage']['WebhookUrl'] and LogOpts['LogGeneralUpdates']:
-            self.Notifier.SendNotification("Crafting cycle complete.")
-    
     def ExecuteBaitPurchase(self):
         self.State.LastBaitPurchaseTime = time.time()
         self.State.UpdateStatus("Opening Shop")
@@ -2868,35 +2436,95 @@ class AutomatedFishingSystem:
         self.State.UpdateStatus("Bait purchased successfully")
     
     def ScanForCaughtFruit(self):
-        # Runs off the fishing thread after each catch: watch the "New Item" popup for a devil fruit
+        # Runs off the fishing thread after each catch and watches for GPO's devil fruit drop banner
         if not self.OcrManager.Enabled:
             return
+        self.State.FruitScanId += 1
+        ScanId = self.State.FruitScanId
         CatchNumber = self.State.TotalFishCaught
-        # OCR runs on CPU without CUDA (~1-3s per read), so allow a few reads for the popup to appear
+        # OCR runs on CPU without CUDA (~1-4s per read), so allow a couple of reads for the banner to appear.
+        # A newer catch takes over, so only one scan competes with the minigame for CPU at a time
         Deadline = time.time() + 7.0
         Attempt = 0
-        while time.time() < Deadline and self.State.IsRunning:
-            FruitName = self.FruitDetector.DetectNewItem()
-            Attempt += 1
-            LogLine(f"FRUIT scan catch#{CatchNumber} try{Attempt}: {self.FruitDetector.LastRawText!r} -> {FruitName}")
-            if Attempt == 1:
-                self.SaveFruitScanDebug(CatchNumber)
-            if FruitName:
-                # The popup can outlive one catch; skip a re-read of the same notification
-                if time.time() - self.State.LastCaughtFruitTime < 8:
-                    return
-                self.State.LastCaughtFruitTime = time.time()
-                Rarity = self.State.IncrementDevilFruitCount(FruitName)
-                self.State.FruitsCountedBeforeStore.append((FruitName, Rarity))
-                self.State.FruitPendingStore = True
-                LogLine(f"FRUIT caught {FruitName} ({Rarity})")
-                self.Notifier.SendNotification(f"Devil Fruit {FruitName} ({Rarity}) caught!")
+        while time.time() < Deadline and self.State.IsRunning and ScanId == self.State.FruitScanId:
+            try:
+                Text = self.FruitDetector.ReadRegion()
+            except Exception as E:
+                LogLine(f"FRUIT scan error: {E}")
                 return
+            if Text is None:
+                return
+            Attempt += 1
+            Notices = self.FruitDetector.ParseNotices(Text)
+            LogLine(f"FRUIT scan catch#{CatchNumber} try{Attempt}: {Text!r} -> {Notices}")
+            if Notices['Drop']:
+                if self.RecordFruitDrop(Notices['Pity'], Notices['ItemFruit']):
+                    self.SaveFruitScanDebug(CatchNumber)
+                return
+            if Notices['ItemFruit']:
+                self.NameRecentFruit(Notices['ItemFruit'])
             time.sleep(0.5)
 
+    def RecordFruitDrop(self, Pity, Name=None):
+        # Returns True for a new drop. The banner stays up for several seconds and back-to-back catches can both
+        # read it, so a sighting within 12s of the last one is the same drop unless the pity counter moved, and the
+        # same pity value within 45s is the same drop too. Two drops can't share a pity value that close together:
+        # every drop moves it (up by one, or back to 0 on a legendary)
+        with self.State.FruitLock:
+            Now = time.time()
+            Last = self.State.LastFruitDrop
+            if Last:
+                Age = Now - Last['Time']
+                BothKnown = Pity is not None and Last['Pity'] is not None
+                if (Age < 12 and not (BothKnown and Pity != Last['Pity'])) or (Age < 45 and BothKnown and Pity == Last['Pity']):
+                    if Last['Pity'] is None and Pity is not None:
+                        Last['Pity'] = Pity
+                        Last['Entry']['pity'] = Pity
+                        if Pity == 0:
+                            self.State.UpdateFruit(Last['Entry'], Rarity="Legendary")
+                    if Name and Last['Entry']['name'] == "Unknown":
+                        self.State.UpdateFruit(Last['Entry'], Name=Name, Rarity=FruitRarities[Name])
+                    return False
+
+            # "LEGENDARY PITY" counts drops since the last legendary, so a reset to 0 means this drop was legendary
+            # and any other value means it wasn't. A name seen with the banner is more specific still
+            Rarity = FruitRarities[Name] if Name else ("Legendary" if Pity == 0 else "Unknown")
+            self.State.IncrementDevilFruitCount(Name, Rarity, Pity)
+            self.State.LastFruitDrop = {'Time': Now, 'Pity': Pity, 'Entry': self.State.FruitHistory[-1]}
+            self.State.FruitPendingStore = True
+
+        Label = f"{Name} ({Rarity})" if Name else ("(Legendary)" if Rarity == "Legendary" else "(not legendary)")
+        PityText = f", legendary pity {Pity}/40" if Pity is not None else ""
+        LogLine(f"FRUIT drop #{self.State.TotalDevilFruits}: {Label}{PityText}")
+        self.Notifier.SendNotification(f"Devil Fruit {Label} caught!{PityText}")
+        return True
+
+    def NameRecentFruit(self, Name):
+        # "New Item <Fruit>" shows the first time a fruit type is obtained or stored, often a few catches after its
+        # drop banner. It never counts on its own; it names the newest unnamed drop whose rarity fits
+        with self.State.FruitLock:
+            Now = time.time()
+            LastName, LastTime = self.State.LastNamedFruit
+            # The popup lingers, so a repeat of the same name within a minute is the same popup
+            if Name == LastName and Now - LastTime < 60:
+                return
+            Rarity = FruitRarities[Name]
+            for Entry in reversed(self.State.FruitHistory):
+                if Now - Entry['timestamp'] > 600:
+                    break
+                if Entry['name'] != "Unknown":
+                    continue
+                Fits = Entry['rarity'] == Rarity or (
+                    Entry['rarity'] == "Unknown" and (Entry['pity'] is None or Rarity not in ("Legendary", "Mythical")))
+                if Fits:
+                    self.State.LastNamedFruit = (Name, Now)
+                    self.State.UpdateFruit(Entry, Name=Name, Rarity=Rarity)
+                    LogLine(f"FRUIT named {Name} ({Rarity}) from New Item popup")
+                    return
+
     def SaveFruitScanDebug(self, CatchNumber, Keep=20):
-        # Save the full screen, the scanned region and the OCR text right after a catch,
-        # so a missed fruit popup can be located and the Fruit Detection Area corrected
+        # Save the full screen, the scanned region and the OCR text for a counted drop, so a count can be checked
+        # against what was on screen and the Fruit Detection Area corrected if needed
         try:
             DebugDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FruitScanDebug")
             os.makedirs(DebugDir, exist_ok=True)
@@ -2918,191 +2546,133 @@ class AutomatedFishingSystem:
         except Exception as E:
             print(f"Fruit scan debug save failed: {E}")
 
-    def CountStoredFruit(self):
-        # Store-cycle fallback: only count fruits the catch-time scan missed
-        if self.State.FruitsCountedBeforeStore:
-            return self.State.FruitsCountedBeforeStore.pop(0)
-        FruitName = self.FruitDetector.IdentifyStoredFruit()
-        return FruitName or "Unknown", self.State.IncrementDevilFruitCount(FruitName)
-
     def ExecuteFruitStorage(self):
+        # Moves caught fruits into storage. Counting happens at catch time from the drop banner, never here: the
+        # store button's colour check can't tell which fruit (or whether one) was stored
         self.State.UpdateStatus("Storing Devil Fruit")
-        
+
         Points = self.Config.Settings['ClickPoints']
         DevilFruitSlots = self.Config.Settings['InventoryHotkeys']['DevilFruits']
-        
+        Delays = self.Config.Settings['TimingDelays']['DevilFruitStorage']
+
         if self.Config.Settings['DevilFruitStorage']['StoreToBackpack']:
             BackpackLocations = Points.get('BackpackLocations', [])
             keyboard.press_and_release('`')
-            
+
             for SlotIdx, Slot in enumerate(DevilFruitSlots):
                 if not self.State.IsRunning:
                     return
-                
-                BackpackLoc = BackpackLocations[SlotIdx] if SlotIdx < len(BackpackLocations) else None
-                TargetLocation = BackpackLoc
-                
+
+                TargetLocation = BackpackLocations[SlotIdx] if SlotIdx < len(BackpackLocations) else None
+                if not TargetLocation or not Points['StoreFruit']:
+                    continue
+
                 self.State.UpdateStatus(f"Opening inventory for slot {Slot} ({SlotIdx+1}/{len(DevilFruitSlots)})")
-                
-                time.sleep(self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitHotkeyDelay'])
+                time.sleep(Delays['StoreFruitHotkeyDelay'])
                 if not self.State.IsRunning:
                     return
-                
+
                 self.State.UpdateStatus(f"Clicking fruit location for slot {Slot}")
                 self.InputController.ClickPoint(TargetLocation)
-                time.sleep(self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitClickDelay'])
+                time.sleep(Delays['StoreFruitClickDelay'])
                 if not self.State.IsRunning:
                     return
-                
+
                 self.State.UpdateStatus(f"Checking Fruit Status for slot {Slot}")
-                InitGreen = ColorDetector.DetectGreenish(Points['StoreFruit']) if Points['StoreFruit'] else False
+                InitGreen = ColorDetector.DetectGreenish(Points['StoreFruit'])
 
-                if Points['StoreFruit']:
-                    self.InputController.ClickPoint(Points['StoreFruit'])
-                    if not self.State.IsRunning:
-                        return
-
-                    ctypes.windll.user32.SetCursorPos(TargetLocation['x'], TargetLocation['y'])
-                    time.sleep(0.1)
-                    self.HumanizeMovement()
-                    if not self.State.IsRunning:
-                        return
-
-                    pyautogui.mouseDown()
-                    time.sleep(0.1)
-                    if not self.State.IsRunning:
-                        pyautogui.mouseUp()
-                        return
-
-                    ctypes.windll.user32.SetCursorPos(TargetLocation['x'], TargetLocation['y'] - 150)
-                    self.HumanizeMovement()
-                    pyautogui.mouseUp()
-
-                    time.sleep(self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitClickDelay'] + 0.5)
-
-                    if InitGreen and not ColorDetector.DetectGreenish(Points['StoreFruit']):
-                        FruitName, Rarity = self.CountStoredFruit()
-                        self.State.UpdateStatus(f"Fruit stored (slot {Slot})")
-                        self.Notifier.SendNotification(f"Devil Fruit {FruitName} ({Rarity}) stored successfully! (Slot {Slot})")
-                    elif InitGreen:
-                        self.State.UpdateStatus(f"Fruit storage failed (slot {Slot})")
-                        self.Notifier.SendNotification(f"Devil Fruit could not be stored. (Slot {Slot})")
-                            
-            keyboard.press_and_release('`')
-
-        elif Points['StoreFruit']:
-            for Slot in DevilFruitSlots:
-                self.State.RodEquipped = False
-                keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['Alternate'])
-                time.sleep(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'])
-
-                keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['Rod'])
-                time.sleep(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'])
-
-                keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['Rod'])
-                time.sleep(self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'])
-
-                keyboard.press_and_release(Slot)
-                time.sleep(self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitHotkeyDelay'])
-                if not self.State.IsRunning:
-                    return
-
-                self.State.UpdateStatus("Checking Fruit Status")
-                InitGreen = False
-                if ColorDetector.DetectGreenish(Points['StoreFruit']):
-                    InitGreen = True
-                        
                 self.InputController.ClickPoint(Points['StoreFruit'])
                 if not self.State.IsRunning:
                     return
-                
-                if InitGreen:
-                    time.sleep(self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitClickDelay'] + 0.5)
+
+                ctypes.windll.user32.SetCursorPos(TargetLocation['x'], TargetLocation['y'])
+                time.sleep(0.1)
+                self.HumanizeMovement()
+                if not self.State.IsRunning:
+                    return
+
+                pyautogui.mouseDown()
+                time.sleep(0.1)
+                if not self.State.IsRunning:
+                    pyautogui.mouseUp()
+                    return
+
+                ctypes.windll.user32.SetCursorPos(TargetLocation['x'], TargetLocation['y'] - 150)
+                self.HumanizeMovement()
+                pyautogui.mouseUp()
+
+                time.sleep(Delays['StoreFruitClickDelay'] + 0.5)
+
+                if InitGreen and not ColorDetector.DetectGreenish(Points['StoreFruit']):
+                    self.State.UpdateStatus(f"Fruit stored (slot {Slot})")
+                    self.Notifier.SendNotification(f"Devil Fruit stored successfully! (Slot {Slot})")
+                elif InitGreen:
+                    self.State.UpdateStatus(f"Fruit storage failed (slot {Slot})")
+                    self.Notifier.SendNotification(f"Devil Fruit could not be stored. (Slot {Slot})")
+
+            keyboard.press_and_release('`')
+
+        elif Points['StoreFruit']:
+            Hotkeys = self.Config.Settings['InventoryHotkeys']
+            SelectDelay = self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay']
+            for Slot in DevilFruitSlots:
+                if not self.State.IsRunning:
+                    return
+                # A duplicate the game refused earlier is still in its slot; retrying it every sweep only costs time
+                if Slot in self.State.UnstorableSlots:
+                    continue
+
+                # Hold another item first: the slot keys toggle, so pressing an already-held slot would put it away
+                self.State.RodEquipped = False
+                self.TapKey(Hotkeys['Alternate'])
+                time.sleep(SelectDelay)
+                self.TapKey(Slot)
+                time.sleep(Delays['StoreFruitHotkeyDelay'])
+                if not self.State.IsRunning:
+                    return
+
+                # The store button only shows (green) while holding a storable fruit; clicking without it would
+                # click into the world with whatever the slot holds
+                self.State.UpdateStatus(f"Checking slot {Slot} for a fruit")
+                if not ColorDetector.DetectGreenish(Points['StoreFruit']):
+                    continue
+
+                Stored = False
+                for _ in range(2):
+                    self.State.UpdateStatus(f"Storing fruit from slot {Slot}")
+                    self.InputController.ClickPoint(Points['StoreFruit'])
+                    time.sleep(Delays['StoreFruitClickDelay'] + 0.5)
+                    if not self.State.IsRunning:
+                        return
                     if not ColorDetector.DetectGreenish(Points['StoreFruit']):
-                        FruitName, Rarity = self.CountStoredFruit()
-                        self.State.UpdateStatus("Fruit stored successfully")
-                        self.Notifier.SendNotification(f"Devil Fruit {FruitName} ({Rarity}) stored successfully!")
-                    else:
-                        self.State.UpdateStatus("Fruit storage failed")
-                        self.Notifier.SendNotification("Devil Fruit could not be stored.")
+                        Stored = True
+                        break
 
-                        if self.Config.Settings['AutomationFeatures']['AutoBuyBait']:
-                            keyboard.press_and_release('shift')
-                            time.sleep(self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitShiftDelay'])
-                            if not self.State.IsRunning:
-                                return
-                        
-                        keyboard.press_and_release('backspace')
-                        time.sleep(self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitBackspaceDelay'])
-                        if not self.State.IsRunning:
-                            return
+                if Stored:
+                    self.State.UpdateStatus(f"Fruit stored (slot {Slot})")
+                    self.Notifier.SendNotification(f"Devil Fruit stored successfully! (Slot {Slot})")
+                    continue
 
-                        if self.Config.Settings['AutomationFeatures']['AutoBuyBait']:
-                            keyboard.press_and_release('shift')
-    
-    def ExecuteSellCycle(self):
-        Points = self.Config.Settings['ClickPoints']
-        SellLeftPoint = Points['SellLeft']
-        SellMiddlePoint = Points['SellMiddle']
-        SellSelectTopPoint = Points['SellSelectTop']
-        SellAcceptPoint = Points['SellAccept']
-        SellClosePoint = Points['SellClose']
-        RepeatCount = self.Config.Settings['AutomationFrequencies']['SellRepeatCount']
+                # Usually "You can only store one of each fruit!": the storage already has this one
+                self.State.UnstorableSlots.add(Slot)
+                LogLine(f"FRUIT slot {Slot} could not be stored (likely a duplicate); skipping it until restart")
+                if not self.Config.Settings['DevilFruitStorage'].get('DropUnstorable', False):
+                    self.State.UpdateStatus(f"Slot {Slot} can't be stored - keeping it")
+                    self.Notifier.SendNotification(f"Devil Fruit in slot {Slot} could not be stored (duplicate?) - kept in inventory.")
+                    continue
 
-        if not (SellLeftPoint and SellMiddlePoint and SellAcceptPoint):
-            self.State.UpdateStatus("Missing points, skipping")
-            return
+                # Opt-in only: a dropped fruit despawns after 10 minutes
+                self.State.UpdateStatus(f"Slot {Slot} can't be stored - dropping it")
+                self.Notifier.SendNotification(f"Devil Fruit in slot {Slot} could not be stored (duplicate?) - dropped.")
+                if self.Config.Settings['AutomationFeatures']['AutoBuyBait']:
+                    keyboard.press_and_release('shift')
+                    time.sleep(Delays['StoreFruitShiftDelay'])
+                keyboard.press_and_release('backspace')
+                time.sleep(Delays['StoreFruitBackspaceDelay'])
+                if self.Config.Settings['AutomationFeatures']['AutoBuyBait']:
+                    keyboard.press_and_release('shift')
+                self.State.UnstorableSlots.discard(Slot)
 
-        self.State.UpdateStatus("Opening Fish Shop")
-
-        keyboard.press_and_release('t')
-        time.sleep(self.Config.Settings['TimingDelays']['PreCast']['SetPrecastEDelay'])
-        if not self.State.IsRunning:
-            return
-
-        self.InputController.ClickPoint(SellLeftPoint)
-        if not self.State.IsRunning:
-            return
-
-        self.InputController.ClickPoint(SellMiddlePoint)
-        if not self.State.IsRunning:
-            return
-
-        self.InputController.ClickPoint(SellMiddlePoint)
-        if not self.State.IsRunning:
-            return
-
-        for SellIteration in range(RepeatCount):
-            if not self.State.IsRunning:
-                break
-
-            self.State.UpdateStatus(f"Iteration {SellIteration + 1}/{RepeatCount}")
-
-            time.sleep(self.Config.Settings['TimingDelays']['PreCast']['PreCastClickDelay'])
-            if not self.State.IsRunning:
-                return
-
-            self.InputController.ClickPoint(SellSelectTopPoint)
-            if not self.State.IsRunning:
-                return
-            
-            self.State.UpdateStatus(f"Accepting {SellIteration + 1}/{RepeatCount}")
-            self.InputController.ClickPoint(SellAcceptPoint)
-            if not self.State.IsRunning:
-                return
-
-            time.sleep(self.Config.Settings['TimingDelays']['PreCast']['PreCastClickDelay'])
-
-        if SellClosePoint:
-            self.State.UpdateStatus("Closing Shop")
-            self.InputController.ClickPoint(SellClosePoint)
-
-        self.State.UpdateStatus("Cycle Complete")
-
-        LogOpts = self.Config.Settings['LoggingOptions']
-        if self.Config.Settings['DevilFruitStorage']['WebhookUrl'] and LogOpts['LogGeneralUpdates']:
-            self.Notifier.SendNotification(f"Auto sell cycle complete ({RepeatCount} sell(s)).")
-    
     def ExecuteSelectTopBait(self):
         Points = self.Config.Settings['ClickPoints']
         if not Points['Bait']:
@@ -3143,11 +2713,11 @@ class AutomatedFishingSystem:
         self.State.TopBaitCounter = 1
         self.State.BaitRescanNeeded = False
 
-        TierOrder = self.Config.Settings['BaitSelector']['TierOrder']
+        ShopBait, ShopTier = self.ShopBaitTier()
         PurchaseFailed = False
-        if self.ShouldRestockPreferredBait(Baits):
-            # Preferred bait is gone: try buying more before touching the insurance tiers
-            self.State.UpdateStatus(f"Out of {TierOrder[0]} - buying more")
+        if self.ShouldRestockShopBait(Baits, ShopTier):
+            # The shop bait is gone and nothing better is left: buy more before falling back to worse tiers
+            self.State.UpdateStatus(f"Out of {ShopBait} - buying more")
             self.ExecuteBaitPurchase()
             # Counts as this cycle's purchase so the regular Auto Buy doesn't immediately buy again
             self.State.BaitPurchaseCounter = 1
@@ -3160,7 +2730,7 @@ class AutomatedFishingSystem:
 
             self.State.UpdateStatus("Rescanning bait list")
             Baits = self.BaitReader.ScanBaits()
-            PurchaseFailed = bool(Baits) and Baits[0]['Tier'] != 0
+            PurchaseFailed = Baits is not None and not any(B['Tier'] == ShopTier for B in Baits)
 
         if not Baits:
             self.State.BaitRemaining = None
@@ -3185,20 +2755,32 @@ class AutomatedFishingSystem:
         self.State.SelectedBaitPoint = Best['Point']
 
         if Previous and Previous != Best['Name']:
-            Reason = f" (couldn't buy {TierOrder[0]} - out of money?)" if PurchaseFailed else ""
+            Reason = f" (couldn't buy {ShopBait} - out of money?)" if PurchaseFailed else ""
             self.NotifyBaitChange(f"Bait switched: {Previous} → {Best['Name']}" + (f" (x{Best['Count']})" if Best['Count'] is not None else "") + Reason)
 
         return True
 
-    def ShouldRestockPreferredBait(self, Baits):
-        if Baits is None or (Baits and Baits[0]['Tier'] == 0):
+    def ShopBaitTier(self):
+        # Auto Buy purchases the bait the shop sells; find where it sits in the tier order. Without it in the list,
+        # treat the first tier as the one to restock (the original behaviour)
+        TierOrder = self.Config.Settings['BaitSelector']['TierOrder']
+        Tier = self.BaitReader.MatchTier(ShopBaitName, TierOrder)
+        return (TierOrder[Tier], Tier) if Tier is not None else (TierOrder[0], 0)
+
+    def ShouldRestockShopBait(self, Baits, ShopTier):
+        # Buying only helps when the shop bait is out and nothing ranked above it is left. With the default
+        # Rare > Legendary > Common order that means all three are out; buying Common while Rare is merely gone
+        # would spend money on bait the order says to use last
+        if Baits is None or any(B['Tier'] == ShopTier for B in Baits):
+            return False
+        if Baits and Baits[0]['Tier'] < ShopTier:
             return False
         if not self.Config.Settings['AutomationFeatures']['AutoBuyBait']:
             return False
         Points = self.Config.Settings['ClickPoints']
         if not (Points['ShopLeft'] and Points['ShopCenter'] and Points['ShopRight']):
             return False
-        # A purchase that just happened and still left us without preferred bait means we are broke;
+        # A purchase that just happened and still left us without shop bait means we are broke;
         # wait for the regular purchase cycle instead of retrying every cast
         return time.time() - self.State.LastBaitPurchaseTime > 60
 
@@ -3206,66 +2788,6 @@ class AutomatedFishingSystem:
         LogOpts = self.Config.Settings['LoggingOptions']
         if self.Config.Settings['DevilFruitStorage']['WebhookUrl'] and LogOpts['LogGeneralUpdates']:
             self.Notifier.SendNotification(Message)
-
-    def ExecutePotionBrew(self):
-        self.State.UpdateStatus("Starting Potion Brew Cycle")
-        Delays = self.Config.Settings['TimingDelays']['PotionBrew']
-        Points = self.Config.Settings['ClickPoints']
-
-        ItemPos = self.FindItemOnScreen()
-
-        if ItemPos is None:
-            keyboard.press_and_release('`')
-            time.sleep(0.1)
-
-            if not self.State.IsRunning:
-                return False
-
-            ItemPos = self.FindItemOnScreen(InventoryScan=True)
-
-            if ItemPos is None:
-                self.State.UpdateStatus("Item not found")
-                keyboard.press_and_release('`')
-                return False
-
-            Cx, Cy = ItemPos
-            ctypes.windll.user32.SetCursorPos(Cx, Cy)
-            ctypes.windll.user32.mouse_event(0x0001, 0, 1, 0, 0)
-            time.sleep(0.05)
-            pyautogui.click()
-            time.sleep(0.05)
-            pyautogui.click()
-            time.sleep(0.2)
-            keyboard.press_and_release('`')
-
-        if not self.State.IsRunning:
-            return False
-
-        self.State.RodEquipped = False
-        keyboard.press_and_release(self.Config.Settings['InventoryHotkeys']['PotionBrewSlot'])
-
-        if not self.State.IsRunning:
-            return False
-
-        time.sleep(Delays['BrewEquipDelay'])
-        if not self.State.IsRunning:
-            return False
-
-        ctypes.windll.user32.SetCursorPos(Points['Water']['x'], Points['Water']['y'])
-        time.sleep(self.Config.Settings['TimingDelays']['AntiDetection']['CursorAntiDetectDelay'])
-        if not self.State.IsRunning:
-            return False
-
-        ctypes.windll.user32.mouse_event(0x0001, 0, 1, 0, 0)
-        pyautogui.click()
-
-        if not self.State.IsRunning:
-            return False
-
-        self.State.LastPotionBrewTime = time.time()
-        self.State.UpdateStatus("Potion brew pouring, waiting to finish")
-        time.sleep(Delays['BrewUseDelay'])
-        self.State.UpdateStatus("Potion brew used successfully")
 
     def TapKey(self, Key):
         # Roblox drops zero-length taps; hold the key briefly (Key Spam Prevention) so it registers
@@ -3333,221 +2855,122 @@ class AutomatedFishingSystem:
             if not self.State.IsRunning:
                 return
     
-    def FindItemOnScreen(self, InventoryScan=False):
-        ICONS_FOLDER = r".\pictures"
-
-        icon_files = [
-            f for f in os.listdir(ICONS_FOLDER)
-            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
-        ]
-
-        if not icon_files:
-            return None
-
-        with mss.mss() as Sct:
-            Monitor = Sct.monitors[0]
-            Raw = np.array(Sct.grab(Monitor))
-            Screen = cv2.cvtColor(Raw, cv2.COLOR_BGRA2BGR)
-            ScreenH, ScreenW = Screen.shape[:2]
-
-        Gray = cv2.cvtColor(Screen, cv2.COLOR_BGR2GRAY)
-
-        for icon_file in icon_files:
-            ICON_PATH = os.path.join(ICONS_FOLDER, icon_file)
-
-            Img = cv2.imread(ICON_PATH, cv2.IMREAD_UNCHANGED)
-            if Img is None:
-                continue
-            if len(Img.shape) == 3 and Img.shape[2] == 4:
-                Alpha = Img[:, :, 3:4] / 255.0
-                Img = (Img[:, :, :3].astype(float) * Alpha).astype(np.uint8)
-            else:
-                Img = Img[:, :, :3]
-
-            Template = Img
-            GrayTpl = cv2.cvtColor(Template, cv2.COLOR_BGR2GRAY)
-            Th, Tw = GrayTpl.shape[:2]
-
-            if Tw > ScreenW or Th > ScreenH:
-                continue
-
-            Result = cv2.matchTemplate(Gray, GrayTpl, cv2.TM_CCOEFF_NORMED)
-            _, MaxVal, _, MaxLoc = cv2.minMaxLoc(Result)
-            print(f"Matching {icon_file}: {MaxVal:.4f} at {MaxLoc}")
-            if MaxVal < 0.85:
-                continue
-
-            X, Y = MaxLoc
-            if InventoryScan:
-                if Y >= ScreenH * 3 // 4:
-                    continue
-            else:
-                if Y < ScreenH * 3 // 4:
-                    continue
-
-            return (X + Tw // 2, Y + Th // 2)
-
-        return None
-    
-    def GetStateForAPI(self, clientId=None):
-        CurrentTime = time.time()
-        ActiveSessions = [
-            {
-                'client_id': Cid,
-                'rdp_detected': Stats.get('rdp_detected', False),
-                'rdp_state': Stats.get('rdp_state', 'unknown'),
-                'session_id': self.State.RDPSessionId if Cid == self.State.ClientId else -1,
-                'last_updated': Stats.get('last_seen', 0)
-            }
-
-            for Cid, Stats in self.State.ClientStats.items()
-            if Cid and Cid != 'unknown' and (CurrentTime - Stats.get('last_seen', 0)) < 30
-        ]
-        
-        if clientId is None:
-            clientId = self.State.ClientId
-        
+    def GetLiveState(self):
+        # What changes while fishing. The UI and overlay poll this twice a second, so it stays small: every
+        # request takes the GIL from the minigame loop
+        State = self.State
+        Window = self.Config.Settings['WindowSettings']
         return {
-            "clientId": self.State.ClientId,
-            "activeSessions": ActiveSessions,
-            "storeToBackpack": self.Config.Settings['DevilFruitStorage']['StoreToBackpack'],
-            "loopsPerStore": self.Config.Settings['AutomationFrequencies']['LoopsPerStore'],
-            "fruitSweepLoops": self.Config.Settings['AutomationFrequencies'].get('FruitSweepLoops', 25),
-            "storeOnlyWhenDetected": self.Config.Settings['AutomationFeatures']['StoreOnlyWhenDetected'],
-            "fruitPendingStore": self.State.FruitPendingStore,
+            "isRunning": State.IsRunning,
+            "currentStatus": State.CurrentStatus,
+            "fishCaught": State.TotalFishCaught,
+            "devilFruitsCaught": State.TotalDevilFruits,
+            "devilFruitsByRarity": State.DevilFruitsByRarity,
+            "lastDevilFruit": State.LastDevilFruit,
+            "fruitHistory": State.FruitHistory[-10:],
+            "timeElapsed": State.GetFormattedElapsedTime(),
+            "fishPerHour": round(State.GetFishPerHour(), 1),
+            "totalRecastTimeouts": State.TotalRecastTimeouts,
+            "selectedBait": State.SelectedBait,
+            "baitRemaining": State.BaitRemaining,
+            "fruitPendingStore": State.FruitPendingStore,
             "ocrStatus": "ready" if self.OcrManager.IsReady() else ("loading" if self.OcrManager.Enabled else "off"),
-            "isRunning": self.State.IsRunning,
-            "fishCaught": self.State.TotalFishCaught,
-            "devilFruitsCaught": self.State.TotalDevilFruits,
-            "devilFruitsByRarity": self.State.DevilFruitsByRarity,
-            "lastDevilFruit": self.State.LastDevilFruit,
-            "timeElapsed": self.State.GetFormattedElapsedTime(),
-            "moveDuration": self.Config.Settings['TimingDelays']['Crafting']['MoveDuration'],
-            "fishPerHour": round(self.State.GetFishPerHour(), 1),
-            "waterPoint": self.Config.Settings['ClickPoints']['Water'],
-            "leftPoint": self.Config.Settings['ClickPoints']['ShopLeft'],
-            "middlePoint": self.Config.Settings['ClickPoints']['ShopCenter'],
-            "rightPoint": self.Config.Settings['ClickPoints']['ShopRight'],
-            "storeFruitPoint": self.Config.Settings['ClickPoints']['StoreFruit'],
-            "baitPoint": self.Config.Settings['ClickPoints']['Bait'],
-            "topRecipePoint": self.Config.Settings['ClickPoints']['TopRecipe'],
-            "addRecipePoint": self.Config.Settings['ClickPoints']['AddRecipe'],
-            "craftConfirmPoint": self.Config.Settings['ClickPoints']['CraftConfirm'],
-            "autoUsePotionBrew": self.Config.Settings['AutomationFeatures']['AutoUsePotionBrew'],
-            "potionBrewIntervalMinutes": self.Config.Settings['AutomationFrequencies']['PotionBrewIntervalMinutes'],
-            "backpackLocations": self.Config.Settings['ClickPoints']['BackpackLocations'],
-            "potionBrewSlot": self.Config.Settings['InventoryHotkeys']['PotionBrewSlot'],
-            "brewEquipDelay": self.Config.Settings['TimingDelays']['PotionBrew']['BrewEquipDelay'],
-            "brewUseDelay": self.Config.Settings['TimingDelays']['PotionBrew']['BrewUseDelay'],
-            "hotkeys": self.Config.Settings['Hotkeys'],
-            "rodHotkey": self.Config.Settings['InventoryHotkeys']['Rod'],
-            "anythingElseHotkey": self.Config.Settings['InventoryHotkeys']['Alternate'],
-            "devilFruitHotkeys": self.Config.Settings['InventoryHotkeys']['DevilFruits'],
-            "alwaysOnTop": self.Config.Settings['WindowSettings']['AlwaysOnTop'],
-            "showDebugOverlay": self.Config.Settings['WindowSettings']['ShowDebugOverlay'],
-            "autoBuyCommonBait": self.Config.Settings['AutomationFeatures']['AutoBuyBait'],
-            "autoStoreDevilFruit": self.Config.Settings['AutomationFeatures']['AutoStoreFruit'],
-            "autoSelectTopBait": self.Config.Settings['AutomationFeatures']['AutoSelectTopBait'],
-            "smartBaitSelect": self.Config.Settings['AutomationFeatures']['SmartBaitSelect'],
-            "baitTierOrder": self.Config.Settings['BaitSelector']['TierOrder'],
-            "selectedBait": self.State.SelectedBait,
-            "baitRemaining": self.State.BaitRemaining,
-            "kp": self.Config.Settings['FishingControl']['PdController']['Kp'],
-            "kd": self.Config.Settings['FishingControl']['PdController']['Kd'],
-            "pdClamp": self.Config.Settings['FishingControl']['PdController']['PdClamp'],
-            "castHoldDuration": self.Config.Settings['FishingControl']['Timing']['CastHoldDuration'],
-            "recastTimeout": self.Config.Settings['FishingControl']['Timing']['RecastTimeout'],
-            "fishEndDelay": self.Config.Settings['FishingControl']['Timing']['FishEndDelay'],
-            "catchEndGrace": self.Config.Settings['FishingControl']['Timing'].get('CatchEndGrace', 0.25),
-            "loopsPerPurchase": self.Config.Settings['AutomationFrequencies']['LoopsPerPurchase'],
-            "pdApproachingDamping": self.Config.Settings['FishingControl']['PdController']['PdApproachingDamping'],
-            "pdChasingDamping": self.Config.Settings['FishingControl']['PdController']['PdChasingDamping'],
-            "gapToleranceMultiplier": self.Config.Settings['FishingControl']['Detection']['GapToleranceMultiplier'],
-            "stateResendInterval": self.Config.Settings['FishingControl']['Timing']['StateResendInterval'],
-            "robloxFocusDelay": self.Config.Settings['TimingDelays']['RobloxWindow']['RobloxFocusDelay'],
-            "robloxPostFocusDelay": self.Config.Settings['TimingDelays']['RobloxWindow']['RobloxPostFocusDelay'],
-            "preCastEDelay": self.Config.Settings['TimingDelays']['PreCast']['SetPrecastEDelay'],
-            "preCastClickDelay": self.Config.Settings['TimingDelays']['PreCast']['PreCastClickDelay'],
-            "preCastTypeDelay": self.Config.Settings['TimingDelays']['PreCast']['PreCastTypeDelay'],
-            "preCastAntiDetectDelay": self.Config.Settings['TimingDelays']['PreCast']['PreCastAntiDetectDelay'],
-            "storeFruitHotkeyDelay": self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitHotkeyDelay'],
-            "storeFruitClickDelay": self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitClickDelay'],
-            "storeFruitShiftDelay": self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitShiftDelay'],
-            "storeFruitBackspaceDelay": self.Config.Settings['TimingDelays']['DevilFruitStorage']['StoreFruitBackspaceDelay'],
-            "autoSelectBaitDelay": self.Config.Settings['TimingDelays']['Inventory']['AutoSelectBaitDelay'],
-            "loopsPerTopBait": self.Config.Settings['AutomationFrequencies']['LoopsPerTopBait'],
-            "blackScreenThreshold": self.Config.Settings['FishingControl']['Detection']['BlackScreenThreshold'],
-            "antiMacroSpamDelay": self.Config.Settings['TimingDelays']['AntiDetection']['AntiMacroSpamDelay'],
-            "rodSelectDelay": self.Config.Settings['TimingDelays']['Inventory']['RodSelectDelay'],
-            "cursorAntiDetectDelay": self.Config.Settings['TimingDelays']['AntiDetection']['CursorAntiDetectDelay'],
-            "scanLoopDelay": self.Config.Settings['FishingControl']['Detection']['ScanLoopDelay'],
-            "autoCraftBait": self.Config.Settings['AutomationFeatures']['AutoCraftBait'],
-            "craftLeftPoint": self.Config.Settings['ClickPoints']['CraftLeft'],
-            "craftMiddlePoint": self.Config.Settings['ClickPoints']['CraftMiddle'],
-            "craftButtonPoint": self.Config.Settings['ClickPoints']['CraftButton'],
-            "closeMenuPoint": self.Config.Settings['ClickPoints']['CloseMenu'],
-            "sellLeftPoint": self.Config.Settings['ClickPoints']['SellLeft'],
-            "sellMiddlePoint": self.Config.Settings['ClickPoints']['SellMiddle'],
-            "sellSelectTopPoint": self.Config.Settings['ClickPoints']['SellSelectTop'],
-            "sellAcceptPoint": self.Config.Settings['ClickPoints']['SellAccept'],
-            "sellClosePoint": self.Config.Settings['ClickPoints']['SellClose'],
-            "autoSellFish": self.Config.Settings['AutomationFeatures']['AutoSellFish'],
-            "sellRepeatCount": self.Config.Settings['AutomationFrequencies']['SellRepeatCount'],
-            "loopsPerSell": self.Config.Settings['AutomationFrequencies']['LoopsPerSell'],
-            "craftsPerCycle": self.Config.Settings['AutomationFrequencies']['CraftsPerCycle'],
-            "loopsPerCraft": self.Config.Settings['AutomationFrequencies']['LoopsPerCraft'],
-            "fishCountPerCraft": self.Config.Settings['AutomationFrequencies']['FishCountPerCraft'],
-            "craftMenuOpenDelay": self.Config.Settings['TimingDelays']['Crafting']['CraftMenuOpenDelay'],
-            "craftClickDelay": self.Config.Settings['TimingDelays']['Crafting']['CraftClickDelay'],
-            "craftRecipeSelectDelay": self.Config.Settings['TimingDelays']['Crafting']['CraftRecipeSelectDelay'],
-            "craftAddRecipeDelay": self.Config.Settings['TimingDelays']['Crafting']['CraftAddRecipeDelay'],
-            "craftTopRecipeDelay": self.Config.Settings['TimingDelays']['Crafting']['CraftTopRecipeDelay'],
-            "craftButtonClickDelay": self.Config.Settings['TimingDelays']['Crafting']['CraftButtonClickDelay'],
-            "craftCloseMenuDelay": self.Config.Settings['TimingDelays']['Crafting']['CraftCloseMenuDelay'],
-            "webhookUrl": self.Config.Settings['DevilFruitStorage']['WebhookUrl'],
-            "discordUserId": self.Config.Settings['LoggingOptions']['DiscordUserId'],
-            "logDevilFruit": self.Config.Settings['LoggingOptions']['LogDevilFruit'],
-            "pingDevilFruit": self.Config.Settings['LoggingOptions']['PingDevilFruit'],
-            "logRecastTimeouts": self.Config.Settings['LoggingOptions']['LogRecastTimeouts'],
-            "pingRecastTimeouts": self.Config.Settings['LoggingOptions']['PingRecastTimeouts'],
-            "logPeriodicStats": self.Config.Settings['LoggingOptions']['LogPeriodicStats'],
-            "pingPeriodicStats": self.Config.Settings['LoggingOptions']['PingPeriodicStats'],
-            "logGeneralUpdates": self.Config.Settings['LoggingOptions']['LogGeneralUpdates'],
-            "pingGeneralUpdates": self.Config.Settings['LoggingOptions']['PingGeneralUpdates'],
-            "periodicStatsInterval": self.Config.Settings['LoggingOptions']['PeriodicStatsIntervalMinutes'],
-            "logMacroState": self.Config.Settings['LoggingOptions']['LogMacroState'],
-            "pingMacroState": self.Config.Settings['LoggingOptions']['PingMacroState'],
-            "logErrors": self.Config.Settings['LoggingOptions']['LogErrors'],
-            "pingErrors": self.Config.Settings['LoggingOptions']['PingErrors'],
-            "totalRecastTimeouts": self.State.TotalRecastTimeouts,
-            "enableSpawnDetection": self.Config.Settings['SpawnDetection']['EnableSpawnDetection'],
-            "spawnScanInterval": self.Config.Settings['SpawnDetection']['ScanInterval'],
-            "logSpawns": self.Config.Settings['SpawnDetection']['LogSpawns'],
-            "pingSpawns": self.Config.Settings['SpawnDetection']['PingSpawns'],
-            "baitRecipes": self.Config.Settings['BaitRecipes'],
-            "currentRecipeIndex": self.Config.Settings['CurrentRecipeIndex'],
-            "currentStatus": self.State.CurrentStatus,
-            "megalodonSoundEnabled": self.Config.Settings['FishingModes']['MegalodonSound'],
-            "soundSensitivity": self.Config.Settings['FishingModes']['SoundSensitivity'],
-            "rdp_detected": self.State.RDPDetected,
-            "rdp_session_state": self.State.RDPSessionState,
-            "auto_detect_rdp": self.Config.Settings['RDPSettings']['AutoDetectRDP'],
-            "allow_rdp_execution": self.Config.Settings['RDPSettings']['AllowRDPExecution'],
-            "pause_on_rdp_disconnect": self.Config.Settings['RDPSettings']['PauseOnRDPDisconnect'],
-            "resume_on_rdp_reconnect": self.Config.Settings['RDPSettings']['ResumeOnRDPReconnect'],
-            "enable_device_sync": self.Config.Settings['DeviceSyncSettings']['EnableDeviceSync'],
-            "sync_settings": self.Config.Settings['DeviceSyncSettings']['SyncSettings'],
-            "sync_stats": self.Config.Settings['DeviceSyncSettings']['SyncStats'],
-            "share_fish_count": self.Config.Settings['DeviceSyncSettings']['ShareFishCount'],
-            "sync_interval": self.Config.Settings['DeviceSyncSettings']['SyncIntervalSeconds'],
-            "device_name": self.Config.Settings['DeviceSyncSettings']['DeviceName'],
-            "connected_devices": self.State.ConnectedDevices,
-            "is_syncing": self.State.IsSyncing,
+            "alwaysOnTop": Window['AlwaysOnTop'],
+            "showDebugOverlay": Window['ShowDebugOverlay'],
+        }
+
+    def GetStateForAPI(self):
+        Settings = self.Config.Settings
+        Points = Settings['ClickPoints']
+        Features = Settings['AutomationFeatures']
+        Freq = Settings['AutomationFrequencies']
+        Pd = Settings['FishingControl']['PdController']
+        FishTiming = Settings['FishingControl']['Timing']
+        Detection = Settings['FishingControl']['Detection']
+        Delays = Settings['TimingDelays']
+        LogOpts = Settings['LoggingOptions']
+
+        return {
+            **self.GetLiveState(),
+            "storeToBackpack": Settings['DevilFruitStorage']['StoreToBackpack'],
+            "dropUnstorableFruit": Settings['DevilFruitStorage'].get('DropUnstorable', False),
+            "loopsPerStore": Freq['LoopsPerStore'],
+            "fruitSweepLoops": Freq.get('FruitSweepLoops', 25),
+            "storeOnlyWhenDetected": Features['StoreOnlyWhenDetected'],
+            "waterPoint": Points['Water'],
+            "leftPoint": Points['ShopLeft'],
+            "middlePoint": Points['ShopCenter'],
+            "rightPoint": Points['ShopRight'],
+            "storeFruitPoint": Points['StoreFruit'],
+            "baitPoint": Points['Bait'],
+            "backpackLocations": Points['BackpackLocations'],
+            "hotkeys": Settings['Hotkeys'],
+            "rodHotkey": Settings['InventoryHotkeys']['Rod'],
+            "anythingElseHotkey": Settings['InventoryHotkeys']['Alternate'],
+            "devilFruitHotkeys": Settings['InventoryHotkeys']['DevilFruits'],
+            "autoBuyCommonBait": Features['AutoBuyBait'],
+            "autoStoreDevilFruit": Features['AutoStoreFruit'],
+            "autoSelectTopBait": Features['AutoSelectTopBait'],
+            "smartBaitSelect": Features['SmartBaitSelect'],
+            "baitTierOrder": Settings['BaitSelector']['TierOrder'],
+            "kp": Pd['Kp'],
+            "kd": Pd['Kd'],
+            "pdClamp": Pd['PdClamp'],
+            "pdApproachingDamping": Pd['PdApproachingDamping'],
+            "pdChasingDamping": Pd['PdChasingDamping'],
+            "castHoldDuration": FishTiming['CastHoldDuration'],
+            "recastTimeout": FishTiming['RecastTimeout'],
+            "fishEndDelay": FishTiming['FishEndDelay'],
+            "catchEndGrace": FishTiming.get('CatchEndGrace', 0.25),
+            "stateResendInterval": FishTiming['StateResendInterval'],
+            "gapToleranceMultiplier": Detection['GapToleranceMultiplier'],
+            "blackScreenThreshold": Detection['BlackScreenThreshold'],
+            "scanLoopDelay": Detection['ScanLoopDelay'],
+            "loopsPerPurchase": Freq['LoopsPerPurchase'],
+            "loopsPerTopBait": Freq['LoopsPerTopBait'],
+            "robloxFocusDelay": Delays['RobloxWindow']['RobloxFocusDelay'],
+            "robloxPostFocusDelay": Delays['RobloxWindow']['RobloxPostFocusDelay'],
+            "preCastEDelay": Delays['PreCast']['SetPrecastEDelay'],
+            "preCastClickDelay": Delays['PreCast']['PreCastClickDelay'],
+            "preCastTypeDelay": Delays['PreCast']['PreCastTypeDelay'],
+            "preCastAntiDetectDelay": Delays['PreCast']['PreCastAntiDetectDelay'],
+            "storeFruitHotkeyDelay": Delays['DevilFruitStorage']['StoreFruitHotkeyDelay'],
+            "storeFruitClickDelay": Delays['DevilFruitStorage']['StoreFruitClickDelay'],
+            "storeFruitShiftDelay": Delays['DevilFruitStorage']['StoreFruitShiftDelay'],
+            "storeFruitBackspaceDelay": Delays['DevilFruitStorage']['StoreFruitBackspaceDelay'],
+            "autoSelectBaitDelay": Delays['Inventory']['AutoSelectBaitDelay'],
+            "rodSelectDelay": Delays['Inventory']['RodSelectDelay'],
+            "antiMacroSpamDelay": Delays['AntiDetection']['AntiMacroSpamDelay'],
+            "cursorAntiDetectDelay": Delays['AntiDetection']['CursorAntiDetectDelay'],
+            "webhookUrl": Settings['DevilFruitStorage']['WebhookUrl'],
+            "discordUserId": LogOpts['DiscordUserId'],
+            "logDevilFruit": LogOpts['LogDevilFruit'],
+            "pingDevilFruit": LogOpts['PingDevilFruit'],
+            "logRecastTimeouts": LogOpts['LogRecastTimeouts'],
+            "pingRecastTimeouts": LogOpts['PingRecastTimeouts'],
+            "logPeriodicStats": LogOpts['LogPeriodicStats'],
+            "pingPeriodicStats": LogOpts['PingPeriodicStats'],
+            "logGeneralUpdates": LogOpts['LogGeneralUpdates'],
+            "pingGeneralUpdates": LogOpts['PingGeneralUpdates'],
+            "periodicStatsInterval": LogOpts['PeriodicStatsIntervalMinutes'],
+            "logMacroState": LogOpts['LogMacroState'],
+            "pingMacroState": LogOpts['PingMacroState'],
+            "logErrors": LogOpts['LogErrors'],
+            "pingErrors": LogOpts['PingErrors'],
+            "megalodonSoundEnabled": Settings['FishingModes']['MegalodonSound'],
+            "soundSensitivity": Settings['FishingModes']['SoundSensitivity'],
+            "audioDeviceIndex": Settings['AudioDevice']['SelectedDeviceIndex'],
             "is_admin": self.IsAdmin,
         }
-    
+
 FlaskApp = Flask(__name__)
-CORS(FlaskApp)
+# Only the app's own windows may call the API from a browser context; any other web page could otherwise drive
+# the macro (or rewrite the webhook URL) through localhost. Dev builds serve the pages from a loopback dev server
+# (http://127.0.0.1:1430), installed builds from the tauri.localhost origins
+CORS(FlaskApp, origins=[
+    "http://tauri.localhost", "https://tauri.localhost", "tauri://localhost",
+    r"^http://(127\.0\.0\.1|localhost):\d+$",
+])
 
 MacroSystem = AutomatedFishingSystem()
 
@@ -3566,63 +2989,10 @@ with open(PortFile, 'w') as Pf:
 
 @FlaskApp.route('/state', methods=['GET'])
 def GetState():
-    ClientId = request.args.get('clientId', MacroSystem.State.ClientId)
-    
-    if ClientId not in MacroSystem.State.ClientStats:
-        MacroSystem.State.ClientStats[ClientId] = {
-            "fish_caught": 0,
-            "start_time": None,
-            "last_seen": time.time(),
-            "rdp_detected": False,
-            "rdp_state": "unknown"
-        }
-    
-    MacroSystem.State.ClientStats[ClientId]["last_seen"] = time.time()
-    
-    if ClientId == MacroSystem.State.ClientId:
-        MacroSystem.State.ClientStats[ClientId]["fish_caught"] = MacroSystem.State.TotalFishCaught
-        MacroSystem.State.ClientStats[ClientId]["rdp_detected"] = MacroSystem.State.RDPDetected
-        MacroSystem.State.ClientStats[ClientId]["rdp_state"] = MacroSystem.State.RDPSessionState
-    
-    CurrentTime = time.time()
-    StaleClients = [
-        Cid for Cid, Stats in MacroSystem.State.ClientStats.items()
-        if CurrentTime - Stats.get('last_seen', 0) > 30
-    ]
-    for Cid in StaleClients:
-        del MacroSystem.State.ClientStats[Cid]
-    
-    ActiveSessions = []
-    for Cid, Stats in MacroSystem.State.ClientStats.items():
-        if Cid and Cid != 'unknown':
-            ActiveSessions.append({
-                'client_id': Cid,
-                'rdp_detected': Stats.get('rdp_detected', False),
-                'rdp_state': Stats.get('rdp_state', 'unknown'),
-                'session_id': MacroSystem.State.RDPSessionId if Cid == MacroSystem.State.ClientId else -1,
-                'last_updated': Stats.get('last_seen', 0)
-            })
-    
-    TotalFish = MacroSystem.State.TotalFishCaught
-    
-    if MacroSystem.Config.Settings['DeviceSyncSettings']['EnableDeviceSync'] and MacroSystem.Config.Settings['DeviceSyncSettings']['ShareFishCount']:
-        TotalFish = sum(C.get("fish_caught", 0) for C in MacroSystem.State.ClientStats.values())
-    
-    TotalUptime = MacroSystem.State.GetElapsedTime()
-    GlobalFPH = (TotalFish / TotalUptime * 3600) if TotalUptime > 0 else 0
-    
-    BaseResponse = MacroSystem.GetStateForAPI(ClientId)
-    
-    BaseResponse.update({
-        "clientId": MacroSystem.State.ClientId,
-        "currentActiveClientId": MacroSystem.State.ClientId,
-        "activeSessions": ActiveSessions,
-        "clientFishCaught": MacroSystem.State.ClientStats[ClientId].get("fish_caught", 0),
-        "globalFishCaught": TotalFish,
-        "globalFishPerHour": round(GlobalFPH, 1),
-    })
-    
-    return jsonify(BaseResponse)
+    # ?live=1 is the cheap poll; the full settings are only needed when the UI syncs its controls
+    if request.args.get('live'):
+        return jsonify(MacroSystem.GetLiveState())
+    return jsonify(MacroSystem.GetStateForAPI())
 
 
 @FlaskApp.route('/health', methods=['GET'])
@@ -3715,8 +3085,8 @@ def SetFastMode():
                 kernel32.SetPriorityClass(Handle, 0x00000020)
                 kernel32.CloseHandle(Handle)
         else:
-            MacroSystem.Config.LoadFromDisk()
             MacroSystem.OcrManager.Enabled = True
+            MacroSystem.OcrManager.Initialize()
             MacroSystem.State.FastModeEnabled = False
             
             kernel32 = ctypes.windll.kernel32
@@ -3731,33 +3101,13 @@ def SetFastMode():
         return jsonify({"status": "error", "message": str(E)}), 500
 
 
-@FlaskApp.route('/set_window_property', methods=['POST'])
-def SetWindowProperty():
-    try:
-        Data = request.json
-        Prop = Data.get('property')
-        
-        if Prop == 'always_on_top':
-            return jsonify({"alwaysOnTop": MacroSystem.Config.Settings['WindowSettings']['AlwaysOnTop']})
-        
-        return jsonify({"status": "ok"})
-    except Exception as E:
-        return jsonify({"status": "error", "message": str(E)}), 500
-
-
 @FlaskApp.route('/command', methods=['POST'])
 def ProcessCommand():
     try:
         Data = request.json
         Action = Data.get('action')
         Payload = Data.get('payload')
-        
-        ClientId = Data.get('clientId', 'unknown')
-        MacroSystem.State.ClientId = ClientId
-        
-        if ClientId in MacroSystem.State.ClientStats:
-            MacroSystem.State.ClientStats[ClientId]["last_seen"] = time.time()
-        
+
         if not Action:
             return jsonify({"status": "error", "message": "Missing action parameter"}), 400
         
@@ -3829,31 +3179,15 @@ def ProcessCommand():
                 return jsonify({"status": "error", "message": f"Invalid float: {str(E)}"}), 400
         
         ActionMap = {
+            'toggle_macro': lambda: HandleToggleMacro(),
+
             'set_water_point': lambda: HandlePointSelection('ClickPoints.Water'),
             'set_left_point': lambda: HandlePointSelection('ClickPoints.ShopLeft'),
             'set_middle_point': lambda: HandlePointSelection('ClickPoints.ShopCenter'),
             'set_right_point': lambda: HandlePointSelection('ClickPoints.ShopRight'),
             'set_store_fruit_point': lambda: HandlePointSelection('ClickPoints.StoreFruit'),
             'set_bait_point': lambda: HandlePointSelection('ClickPoints.Bait'),
-            'set_craft_left_point': lambda: HandlePointSelection('ClickPoints.CraftLeft'),
-            'set_craft_middle_point': lambda: HandlePointSelection('ClickPoints.CraftMiddle'),
-            'set_bait_recipe_point': lambda: HandlePointSelection('BaitRecipePoint'),
-            'set_add_recipe_point': lambda: HandlePointSelection('ClickPoints.AddRecipe'),
-            'set_top_recipe_point': lambda: HandlePointSelection('ClickPoints.TopRecipe'),
             'set_loops_per_top_bait': lambda: HandleIntValue('AutomationFrequencies.LoopsPerTopBait'),
-            'set_craft_button_point': lambda: HandlePointSelection('ClickPoints.CraftButton'),
-            'set_close_menu_point': lambda: HandlePointSelection('ClickPoints.CloseMenu'),
-            'set_sell_left_point': lambda: HandlePointSelection('ClickPoints.SellLeft'),
-            'set_sell_middle_point': lambda: HandlePointSelection('ClickPoints.SellMiddle'),
-            'set_sell_accept_point': lambda: HandlePointSelection('ClickPoints.SellAccept'),
-            'set_sell_close_point': lambda: HandlePointSelection('ClickPoints.SellClose'),
-            'set_sell_repeat_count': lambda: HandleIntValue('AutomationFrequencies.SellRepeatCount'),
-            'set_loops_per_sell': lambda: HandleIntValue('AutomationFrequencies.LoopsPerSell'),
-            'set_sell_select_top_point': lambda: HandlePointSelection('ClickPoints.SellSelectTop'),
-            'set_potion_brew_interval': lambda: HandleIntValue('AutomationFrequencies.PotionBrewIntervalMinutes'),
-            'set_potion_brew_slot': lambda: HandleStringValue('InventoryHotkeys.PotionBrewSlot'),
-            'set_brew_equip_delay': lambda: HandleFloatValue('TimingDelays.PotionBrew.BrewEquipDelay'),
-            'set_brew_use_delay': lambda: HandleFloatValue('TimingDelays.PotionBrew.BrewUseDelay'),
 
             'toggle_always_on_top': lambda: HandleBoolToggle('WindowSettings.AlwaysOnTop'),
             'toggle_debug_overlay': lambda: HandleBoolToggle('WindowSettings.ShowDebugOverlay'),
@@ -3864,10 +3198,8 @@ def ProcessCommand():
             'set_bait_tier_order': lambda: HandleBaitTierOrder(Payload),
             'test_bait_scan': lambda: HandleTestBaitScan(),
             'open_bait_region_selector': lambda: HandleBaitRegionSelector(),
-            'toggle_auto_sell_fish': lambda: HandleBoolToggle('AutomationFeatures.AutoSellFish'),
-            'toggle_auto_craft_bait': lambda: HandleBoolToggle('AutomationFeatures.AutoCraftBait'),
-            'toggle_auto_use_potion_brew': lambda: HandleBoolToggle('AutomationFeatures.AutoUsePotionBrew'),
             'toggle_store_to_backpack': lambda: HandleBoolToggle('DevilFruitStorage.StoreToBackpack'),
+            'toggle_drop_unstorable_fruit': lambda: HandleBoolToggle('DevilFruitStorage.DropUnstorable'),
             'toggle_log_devil_fruit': lambda: HandleBoolToggle('LoggingOptions.LogDevilFruit'),
             'toggle_log_recast_timeouts': lambda: HandleBoolToggle('LoggingOptions.LogRecastTimeouts'),
             'toggle_log_periodic_stats': lambda: HandleBoolToggle('LoggingOptions.LogPeriodicStats'),
@@ -3881,36 +3213,18 @@ def ProcessCommand():
             'toggle_ping_macro_state': lambda: HandleBoolToggle('LoggingOptions.PingMacroState'),
             'toggle_ping_errors': lambda: HandleBoolToggle('LoggingOptions.PingErrors'),
             'toggle_megalodon_sound': lambda: HandleBoolToggle('FishingModes.MegalodonSound'),
-            'toggle_auto_detect_rdp': lambda: HandleBoolToggle('RDPSettings.AutoDetectRDP'),
-            'toggle_allow_rdp_execution': lambda: HandleBoolToggle('RDPSettings.AllowRDPExecution'),
-            'toggle_pause_on_rdp_disconnect': lambda: HandleBoolToggle('RDPSettings.PauseOnRDPDisconnect'),
-            'toggle_resume_on_rdp_reconnect': lambda: HandleBoolToggle('RDPSettings.ResumeOnRDPReconnect'),
-            'toggle_enable_device_sync': lambda: HandleBoolToggle('DeviceSyncSettings.EnableDeviceSync'),
-            'toggle_sync_settings': lambda: HandleBoolToggle('DeviceSyncSettings.SyncSettings'),
-            'toggle_sync_stats': lambda: HandleBoolToggle('DeviceSyncSettings.SyncStats'),
-            'toggle_share_fish_count': lambda: HandleBoolToggle('DeviceSyncSettings.ShareFishCount'),
-            'toggle_enable_spawn_detection': lambda: HandleBoolToggle('SpawnDetection.EnableSpawnDetection'),
-            'toggle_log_spawns': lambda: HandleBoolToggle('SpawnDetection.LogSpawns'),
-            'toggle_ping_spawns': lambda: HandleBoolToggle('SpawnDetection.PingSpawns'),
 
             'set_rod_hotkey': lambda: HandleStringValue('InventoryHotkeys.Rod'),
             'set_anything_else_hotkey': lambda: HandleStringValue('InventoryHotkeys.Alternate'),
             'set_webhook_url': lambda: HandleStringValue('DevilFruitStorage.WebhookUrl'),
             'set_discord_user_id': lambda: HandleStringValue('LoggingOptions.DiscordUserId'),
-            'set_device_name': lambda: HandleStringValue('DeviceSyncSettings.DeviceName'),
-            'set_client_id': lambda: HandleStringValue('ClientId'),
-            
+
             'set_loops_per_store': lambda: HandleIntValue('AutomationFrequencies.LoopsPerStore'),
             'set_fruit_sweep_loops': lambda: HandleIntValue('AutomationFrequencies.FruitSweepLoops'),
             'toggle_store_only_when_detected': lambda: HandleBoolToggle('AutomationFeatures.StoreOnlyWhenDetected'),
             'set_loops_per_purchase': lambda: HandleIntValue('AutomationFrequencies.LoopsPerPurchase'),
-            'set_fish_count_per_craft': lambda: HandleIntValue('AutomationFrequencies.FishCountPerCraft'),
-            'set_crafts_per_cycle': lambda: HandleIntValue('AutomationFrequencies.CraftsPerCycle'),
-            'set_craft_confirm_point': lambda: HandlePointSelection('ClickPoints.CraftConfirm'),
-            'set_loops_per_craft': lambda: HandleIntValue('AutomationFrequencies.LoopsPerCraft'),
             'set_periodic_stats_interval': lambda: HandleIntValue('LoggingOptions.PeriodicStatsIntervalMinutes'),
-            'set_sync_interval': lambda: HandleIntValue('DeviceSyncSettings.SyncIntervalSeconds'),
-            
+
             'set_kp': lambda: HandleFloatValue('FishingControl.PdController.Kp'),
             'set_kd': lambda: HandleFloatValue('FishingControl.PdController.Kd'),
             'set_pd_clamp': lambda: HandleFloatValue('FishingControl.PdController.PdClamp'),
@@ -3938,17 +3252,8 @@ def ProcessCommand():
             'set_scan_delay': lambda: HandleFloatValue('FishingControl.Detection.ScanLoopDelay'),
             'set_black_threshold': lambda: HandleFloatValue('FishingControl.Detection.BlackScreenThreshold'),
             'set_spam_delay': lambda: HandleFloatValue('TimingDelays.AntiDetection.AntiMacroSpamDelay'),
-            'set_move_duration': lambda: HandleFloatValue('TimingDelays.Crafting.MoveDuration'),
             'set_sound_sensitivity': lambda: HandleFloatValue('FishingModes.SoundSensitivity'),
-            'set_craft_menu_delay': lambda: HandleFloatValue('TimingDelays.Crafting.CraftMenuOpenDelay'),
-            'set_craft_click_delay': lambda: HandleFloatValue('TimingDelays.Crafting.CraftClickDelay'),
-            'set_craft_recipe_delay': lambda: HandleFloatValue('TimingDelays.Crafting.CraftRecipeSelectDelay'),
-            'set_craft_add_delay': lambda: HandleFloatValue('TimingDelays.Crafting.CraftAddRecipeDelay'),
-            'set_craft_top_delay': lambda: HandleFloatValue('TimingDelays.Crafting.CraftTopRecipeDelay'),
-            'set_craft_button_delay': lambda: HandleFloatValue('TimingDelays.Crafting.CraftButtonClickDelay'),
-            'set_craft_close_delay': lambda: HandleFloatValue('TimingDelays.Crafting.CraftCloseMenuDelay'),
-            'set_spawn_scan_interval': lambda: HandleFloatValue('SpawnDetection.ScanInterval'),
-            
+
             'set_backpack_location_point': lambda: HandleBackpackLocationPoint(Payload),
             'test_webhook': lambda: HandleTestWebhook(),
             'open_ocr_area_selector': lambda: HandleOCRAreaSelector(),
@@ -3959,7 +3264,7 @@ def ProcessCommand():
             'reset_settings': lambda: HandleResetSettings(Payload),
             'open_config_folder': lambda: HandleOpenFolder(),
             'view_config': lambda: HandleViewConfig(),
-            'clear_cache': lambda: HandleClearCache(),
+            'reset_stats': lambda: HandleResetStats(),
         }
         
         if Action == 'rebind_hotkey':
@@ -3988,69 +3293,6 @@ def ProcessCommand():
     
     except ValueError as E:
         return jsonify({"status": "error", "message": f"Invalid value: {str(E)}"}), 400
-    except Exception as E:
-        return jsonify({"status": "error", "message": str(E)}), 500
-
-
-@FlaskApp.route('/add_recipe', methods=['POST'])
-def AddRecipe():
-    try:
-        MacroSystem.Config.Settings['BaitRecipes'].append({
-            "BaitRecipePoint": None,
-            "SelectMaxPoint": None,
-            "SwitchFishCycle": 5 
-        })
-        MacroSystem.Config.SaveToDisk()
-        return jsonify({"status": "success", "recipeIndex": len(MacroSystem.Config.Settings['BaitRecipes']) - 1})
-    except Exception as E:
-        return jsonify({"status": "error", "message": str(E)}), 500
-
-
-@FlaskApp.route('/remove_recipe', methods=['POST'])
-def RemoveRecipe():
-    try:
-        Data = request.json
-        Index = int(Data.get('index'))
-        if 0 <= Index < len(MacroSystem.Config.Settings['BaitRecipes']):
-            MacroSystem.Config.Settings['BaitRecipes'].pop(Index)
-            MacroSystem.Config.SaveToDisk()
-            return jsonify({"status": "success"})
-        return jsonify({"status": "error", "message": "Invalid index"}), 400
-    except Exception as E:
-        return jsonify({"status": "error", "message": str(E)}), 500
-
-
-@FlaskApp.route('/update_recipe_value', methods=['POST'])
-def UpdateRecipeValue():
-    try:
-        Data = request.json
-        Index = int(Data.get('recipeIndex'))
-        Field = Data.get('fieldName')
-        Value = int(Data.get('value'))
-        
-        if 0 <= Index < len(MacroSystem.Config.Settings['BaitRecipes']):
-            MacroSystem.Config.Settings['BaitRecipes'][Index][Field] = Value
-            MacroSystem.Config.SaveToDisk()
-            return jsonify({"status": "success"})
-        return jsonify({"status": "error", "message": "Invalid index"}), 400
-    except Exception as E:
-        return jsonify({"status": "error", "message": str(E)}), 500
-
-
-@FlaskApp.route('/set_recipe_point', methods=['POST'])
-def SetRecipePoint():
-    try:
-        Data = request.json
-        Index = int(Data.get('recipeIndex'))
-        PointType = Data.get('pointType')
-        
-        def OnPointSet(Name, Point):
-            MacroSystem.Config.Settings['BaitRecipes'][Index][PointType] = Point
-            MacroSystem.Config.SaveToDisk()
-        
-        MacroSystem.PointSelector.StartSelection(f"Recipe{Index}.{PointType}", OnPointSet)
-        
-        return jsonify({"status": "waiting_for_click"})
     except Exception as E:
         return jsonify({"status": "error", "message": str(E)}), 500
 
@@ -4167,15 +3409,7 @@ def HandleResetSettings(Payload):
 
 def HandleOpenFolder():
     try:
-        Folder = os.path.dirname(MacroSystem.Config.ConfigPath)
-        
-        if platform.system() == "Windows":
-            os.startfile(Folder)
-        elif platform.system() == "Darwin":
-            subprocess.Popen(["open", Folder])
-        else:
-            subprocess.Popen(["xdg-open", Folder])
-        
+        os.startfile(os.path.dirname(MacroSystem.Config.ConfigPath))
         return jsonify({"status": "success"})
     except Exception as E:
         return jsonify({"status": "error", "message": str(E)}), 500
@@ -4212,16 +3446,19 @@ def HandleViewConfig():
         return jsonify({"status": "error", "message": str(E)}), 500
 
 
-def HandleClearCache():
+def HandleToggleMacro():
+    # ToggleMacro can wait on a finishing loop; don't hold the request (or the UI) for it
+    threading.Thread(target=MacroSystem.ToggleMacro, daemon=True).start()
+    return jsonify({"status": "success"})
+
+
+def HandleResetStats():
     try:
         MacroSystem.State.BaitPurchaseCounter = 0
         MacroSystem.State.FruitStorageCounter = 0
-        MacroSystem.State.FishSinceLastCraft = 0
-        MacroSystem.State.BaitCraftCounter = 0
         MacroSystem.State.TotalRecastTimeouts = 0
         MacroSystem.State.ConsecutiveRecastTimeouts = 0
         MacroSystem.State.TopBaitCounter = 0
-        MacroSystem.State.SellCounter = 0
         MacroSystem.State.BaitRescanNeeded = True
 
         MacroSystem.State.TotalFishCaught = 0
@@ -4362,7 +3599,8 @@ def HandleBaitRegionSelector():
 
 
 def RunFlaskServer():
-    FlaskApp.run(host='0.0.0.0', port=Port, debug=False, use_reloader=False)
+    # Loopback only: the API controls mouse/keyboard input, so it must not be reachable from the network
+    FlaskApp.run(host='127.0.0.1', port=Port, debug=False, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":

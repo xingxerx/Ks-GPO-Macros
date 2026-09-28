@@ -1,8 +1,5 @@
 const invoke = window.__TAURI__?.core?.invoke ?? (async (cmd, args) => {
     console.log('[invoke]', cmd, args);
-    if (cmd === 'keyauth_verify') return { success: true };
-    if (cmd === 'open_macro_window') return true;
-    if (cmd === 'get_saved_key') return null;
     if (cmd === 'launch_macro') return { port: window.__BACKEND_PORT__ || 8765 };
     return null;
 });
@@ -17,19 +14,6 @@ const MACROS = [
         visible: true,
         color: '#4f8ef7',
         icon: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 16.5a2 2 0 1 1-4 0c0-1.1 2-4 2-4s2 2.9 2 4z"/><path d="M4 18h2M6 14c0 0 2-2 4-2s4 2 4 2"/><line x1="6" y1="18" x2="6" y2="10"/><line x1="6" y1="10" x2="18" y2="4"/></svg>`,
-        modalIcon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 16.5a2 2 0 1 1-4 0c0-1.1 2-4 2-4s2 2.9 2 4z"/><path d="M4 18h2M6 14c0 0 2-2 4-2s4 2 4 2"/><line x1="6" y1="18" x2="6" y2="10"/><line x1="6" y1="10" x2="18" y2="4"/></svg>`,
-    },
-    {
-        id: 'juzo',
-        name: 'Juzo Macro',
-        comingSoon: false,
-        desc: 'Automated Juzo boss fights with smart dodge and attack patterns.',
-        tag: 'JUZO',
-        free: false,
-        visible: true,
-        color: '#a855f7',
-        icon: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>`,
-        modalIcon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>`,
     },
     {
         id: 'mihawk',
@@ -41,7 +25,6 @@ const MACROS = [
         visible: true,
         color: '#e0b854',
         icon: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><polyline points="8 6 18 6 18 16"/></svg>`,
-        modalIcon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><polyline points="8 6 18 6 18 16"/></svg>`,
     },
     {
         id: 'roger',
@@ -53,12 +36,8 @@ const MACROS = [
         visible: true,
         color: '#e05555',
         icon: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>`,
-        modalIcon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>`,
     },
 ];
-
-let activeMacro = null;
-let verifying = false;
 
 function hexToRgb(hex) {
     const r = parseInt(hex.slice(1, 3), 16);
@@ -84,7 +63,7 @@ function buildGrid() {
         row.style.animationDelay = `${i * 0.04}s`;
 
         if (!m.comingSoon) {
-            row.onclick = () => handleCardClick(row, m.id, m.name);
+            row.onclick = () => handleCardClick(row, m.id);
         }
 
         const lockIcon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>`;
@@ -129,20 +108,8 @@ function setRowLoading(id, loading) {
     }
 }
 
-async function handleCardClick(rowEl, macro_id, displayName) {
+async function handleCardClick(rowEl, macro_id) {
     if (rowEl.classList.contains('card-loading')) return;
-
-    const macro = MACROS.find(m => m.id === macro_id);
-
-    if (!macro?.free) {
-        setRowLoading(macro_id, true);
-        setToast(`Loading ${displayName}…`, true);
-        await new Promise(r => setTimeout(r, 700));
-        setToast('', false);
-        setRowLoading(macro_id, false);
-        openKeyModal(macro_id, displayName);
-        return;
-    }
 
     setRowLoading(macro_id, true);
     setToast('Starting backend…', true);
@@ -158,175 +125,6 @@ async function handleCardClick(rowEl, macro_id, displayName) {
         setTimeout(() => setToast('', false), 3000);
     } finally {
         setRowLoading(macro_id, false);
-    }
-}
-
-async function openKeyModal(macro_id, displayName) {
-    activeMacro = macro_id;
-    const macro = MACROS.find(m => m.id === macro_id);
-
-    if (macro?.free) {
-        await invoke('launch_macro', { macroName: macro_id });
-        document.getElementById('rippleRing').classList.add('go');
-        return;
-    }
-
-    try {
-        const saved = await invoke('get_saved_key', { macroName: macro_id });
-        if (saved) {
-            await autoLogin(macro_id, displayName, saved);
-            return;
-        }
-    } catch (_) { }
-
-    showModal(macro_id, displayName);
-}
-
-function applyModalColors(macro_id) {
-    const macro = MACROS.find(m => m.id === macro_id);
-    if (!macro) return;
-    const rgb = hexToRgb(macro.color);
-    const iconEl = document.getElementById('modalIcon');
-    iconEl.style.background = `rgba(${rgb},0.1)`;
-    iconEl.style.borderColor = `rgba(${rgb},0.25)`;
-    iconEl.style.color = macro.color;
-    iconEl.innerHTML = macro.modalIcon ?? '';
-    document.getElementById('modalStrip').style.background = macro.color;
-    document.getElementById('btnVerify').style.background = macro.color;
-}
-
-async function autoLogin(macro_id, displayName, key) {
-    activeMacro = macro_id;
-    applyModalColors(macro_id);
-
-    document.getElementById('modalTitle').textContent = displayName;
-    document.getElementById('modalSub').textContent = 'Verifying saved key…';
-    document.getElementById('keyInputWrap').className = 'key-input-wrap';
-    const inputEl = document.getElementById('keyInput');
-    inputEl.value = key;
-    document.getElementById('keyClear').style.display = 'none';
-    setFeedback('Verifying saved key…', '');
-    setVerifyLoading(true);
-
-    document.getElementById('modalBackdrop').classList.add('visible');
-    document.getElementById('keyModal').classList.add('visible');
-
-    try {
-        const result = await invoke('keyauth_verify', { key, macroName: macro_id });
-
-        if (result?.success) {
-            document.getElementById('keyInputWrap').className = 'key-input-wrap success';
-            setFeedback('Verified — launching…', 'success');
-            await new Promise(r => setTimeout(r, 500));
-            setToast('Starting backend…', true);
-            await invoke('launch_macro', { macroName: macro_id });
-            setToast('', false);
-            document.getElementById('rippleRing').classList.add('go');
-        } else {
-            document.getElementById('modalSub').textContent = 'Saved key rejected — enter a new one';
-            document.getElementById('keyInput').value = '';
-            document.getElementById('keyInputWrap').className = 'key-input-wrap error';
-            setFeedback('Saved key is invalid or expired.', 'error');
-            setVerifyLoading(false);
-        }
-    } catch (e) {
-        document.getElementById('modalSub').textContent = 'Saved key rejected — enter a new one';
-        document.getElementById('keyInput').value = '';
-        document.getElementById('keyInputWrap').className = 'key-input-wrap error';
-        setFeedback(e?.toString().replace('Error: ', '') || 'Verification failed.', 'error');
-        setVerifyLoading(false);
-    }
-}
-
-function showModal(macro_id, displayName) {
-    applyModalColors(macro_id);
-    document.getElementById('modalTitle').textContent = displayName;
-    document.getElementById('modalSub').textContent = 'Enter your license key to continue';
-    document.getElementById('keyInputWrap').className = 'key-input-wrap';
-    document.getElementById('keyInput').value = '';
-    document.getElementById('keyClear').style.display = 'none';
-    setFeedback('', '');
-    setVerifyLoading(false);
-
-    document.getElementById('modalBackdrop').classList.add('visible');
-    document.getElementById('keyModal').classList.add('visible');
-
-    setTimeout(() => document.getElementById('keyInput').focus(), 220);
-}
-
-function closeKeyModal() {
-    if (verifying) return;
-    document.getElementById('keyModal').classList.remove('visible');
-    document.getElementById('modalBackdrop').classList.remove('visible');
-    activeMacro = null;
-}
-
-function clearKey() {
-    const input = document.getElementById('keyInput');
-    input.value = '';
-    input.focus();
-    document.getElementById('keyClear').style.display = 'none';
-    document.getElementById('keyInputWrap').className = 'key-input-wrap';
-    setFeedback('', '');
-}
-
-function handleKeyDown(e) {
-    if (e.key === 'Enter') verifyKey();
-    if (e.key === 'Escape') closeKeyModal();
-    setTimeout(() => {
-        const input = document.getElementById('keyInput');
-        document.getElementById('keyClear').style.display = input.value.length > 0 ? 'flex' : 'none';
-    }, 0);
-}
-
-function setFeedback(msg, type) {
-    const el = document.getElementById('keyFeedback');
-    el.className = 'key-feedback' + (type ? ` ${type}` : '');
-    el.textContent = msg;
-}
-
-function setVerifyLoading(loading) {
-    verifying = loading;
-    const btn = document.getElementById('btnVerify');
-    btn.disabled = loading;
-    document.getElementById('verifyLabel').style.display = loading ? 'none' : 'inline';
-    document.getElementById('verifySpinner').style.display = loading ? 'block' : 'none';
-}
-
-async function verifyKey() {
-    if (verifying) return;
-
-    const key = document.getElementById('keyInput').value.trim();
-    if (!key) {
-        document.getElementById('keyInputWrap').className = 'key-input-wrap error';
-        setFeedback('Please enter a license key.', 'error');
-        return;
-    }
-
-    setVerifyLoading(true);
-    setFeedback('Contacting KeyAuth…', '');
-    document.getElementById('keyInputWrap').className = 'key-input-wrap';
-
-    try {
-        const result = await invoke('keyauth_verify', { key, macroName: activeMacro });
-
-        if (result?.success) {
-            document.getElementById('keyInputWrap').className = 'key-input-wrap success';
-            setFeedback('Key verified — launching…', 'success');
-            await new Promise(r => setTimeout(r, 600));
-            setToast('Starting backend…', true);
-            await invoke('launch_macro', { macroName: activeMacro });
-            setToast('', false);
-            document.getElementById('rippleRing').classList.add('go');
-        } else {
-            document.getElementById('keyInputWrap').className = 'key-input-wrap error';
-            setFeedback('Invalid or expired key.', 'error');
-            setVerifyLoading(false);
-        }
-    } catch (e) {
-        document.getElementById('keyInputWrap').className = 'key-input-wrap error';
-        setFeedback(e?.toString().replace('Error: ', '') || 'Verification failed.', 'error');
-        setVerifyLoading(false);
     }
 }
 

@@ -173,13 +173,8 @@ fn CompileBackendPyc(PythonExe: &PathBuf, BackendPy: &PathBuf) {
     match Output {
         Ok(Out) => {
             if Out.status.success() {
+                // backend.py is the source file in src-tauri, not a build copy, so it stays; only the .pyc is bundled
                 println!("cargo:warning=backend.pyc written to {:?}", BackendPycStr);
-
-                if let Err(E) = fs::remove_file(BackendPy) {
-                    println!("cargo:warning=Could not remove backend.py: {}", E);
-                } else {
-                    println!("cargo:warning=backend.py removed from output (only .pyc ships)");
-                }
             } else {
                 let Stderr = String::from_utf8_lossy(&Out.stderr);
                 println!("cargo:warning=py_compile failed: {}", Stderr);
@@ -215,13 +210,19 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../requirements.txt");
 
+    println!("cargo:rerun-if-env-changed=GPO_PYTHON_DIR");
+
     if BuildProfile == "release" {
-        let PythonSourcePath = PathBuf::from(
-            r"C:\Users\zomrd\AppData\Local\Programs\Python\Python314"
-        );
+        // The Python install to bundle (with the requirements installed into it). Set GPO_PYTHON_DIR to override
+        let PythonSourcePath = env::var("GPO_PYTHON_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+            PathBuf::from(env::var("LOCALAPPDATA").unwrap_or_default()).join(r"Programs\Python\Python314")
+        });
 
         if !PythonSourcePath.exists() {
-            panic!("Python source directory not found at: {:?}", PythonSourcePath);
+            panic!(
+                "Python to bundle not found at {:?}. Install Python 3.14 there or set GPO_PYTHON_DIR to its folder.",
+                PythonSourcePath
+            );
         }
 
         fs::create_dir_all(&SavedHashesDir)
@@ -283,11 +284,10 @@ fn main() {
             println!("cargo:warning=requirements.txt unchanged — skipping Python copy.");
         }
 
-        let ProjectRoot = SrcTauriPath.parent().unwrap();
-        let BackendPy   = ProjectRoot.join("backend.py");
-        let PythonExe   = PythonDestinationPath.join("python.exe");
+        let BackendPy = SrcTauriPath.join("backend.py");
+        let PythonExe = PythonDestinationPath.join("python.exe");
 
-        println!("cargo:rerun-if-changed=../backend.py");
+        println!("cargo:rerun-if-changed=backend.py");
 
         CompileBackendPyc(&PythonExe, &BackendPy);
 

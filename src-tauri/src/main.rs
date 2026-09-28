@@ -4,9 +4,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use sysinfo::System;
+use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
 
 struct PythonProcess(Mutex<Option<Child>>);
@@ -61,15 +62,6 @@ fn is_position_visible(x: i64, y: i64, app: &AppHandle) -> bool {
     false
 }
 
-fn get_current_username() -> String {
-    String::from_utf8_lossy(
-        &Command::new("whoami")
-            .output()
-            .unwrap_or_else(|_| Command::new("cmd").args(&["/C", "echo %USERNAME%"]).output().unwrap())
-            .stdout
-    ).trim().to_string()
-}
-
 #[tauri::command]
 fn frontend_log(message: String) {
     let path = logs_dir().join("frontend.txt");
@@ -78,108 +70,57 @@ fn frontend_log(message: String) {
     }
 }
 
-fn kill_existing_backend() {
-    log("Killing existing backend processes for current user");
-    #[cfg(target_os = "windows")]
-    {
-        let username = get_current_username();
-        if username.is_empty() {
-            log("WARNING: Could not determine current user, skipping kill");
-            return;
+// Kills leftover macro backends: python processes running backend.py/.pyc. Matching on the script keeps
+// unrelated Python work (notebooks, other tools) alive, which the old "every python.exe" sweep did not
+fn kill_backend_processes() -> u32 {
+    let own_pid = std::process::id();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessRefreshKind::new().with_cmd(UpdateKind::Always));
+
+    let mut killed = 0;
+    for (pid, process) in sys.processes() {
+        if pid.as_u32() == own_pid || !process.name().to_lowercase().starts_with("python") {
+            continue;
         }
-        log(&format!("Killing backend for user: {}", username));
-        for image in &["pythonw.exe", "python.exe"] {
-            if let Ok(output) = Command::new("tasklist")
-                .args(&[
-                    "/FI", &format!("USERNAME eq {}", username),
-                    "/FI", &format!("IMAGENAME eq {}", image),
-                    "/FO", "CSV",
-                    "/NH"
-                ])
-                .output()
-            {
-                let text = String::from_utf8_lossy(&output.stdout);
-                for line in text.lines() {
-                    let parts: Vec<&str> = line.split(',').collect();
-                    if parts.len() >= 2 {
-                        let pid = parts[1].trim().trim_matches('"');
-                        if pid.is_empty() { continue; }
-                        let _ = Command::new("taskkill").args(&["/F", "/PID", pid]).output();
-                        log(&format!("Killed {} PID {} for user {}", image, pid, username));
-                    }
-                }
-            }
+        // The launcher always passes --pid, which keeps some other project's backend.py out of this
+        let cmd = process.cmd();
+        let is_backend = cmd.iter().any(|arg| arg == "--pid")
+            && cmd.iter().any(|arg| {
+                let arg = arg.to_lowercase();
+                arg.ends_with("backend.pyc") || arg.ends_with("backend.py")
+            });
+        if is_backend && process.kill() {
+            log(&format!("Killed backend {} (PID {})", process.name(), pid.as_u32()));
+            killed += 1;
         }
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    log("User-scoped backend kill complete");
-}
-
-#[allow(unused_variables)]
-fn kill_all_backend_processes(launcher_pid: u32) {
-    log("Nuclear kill: all backend processes for current user");
-    #[cfg(target_os = "windows")]
-    {
-        let username = get_current_username();
-        if username.is_empty() {
-            log("WARNING: Could not determine current user, skipping nuclear kill");
-            return;
-        }
-        log(&format!("Nuclear kill for user: {}", username));
-        for image in &["pythonw.exe", "python.exe"] {
-            if let Ok(output) = Command::new("tasklist")
-                .args(&[
-                    "/FI", &format!("USERNAME eq {}", username),
-                    "/FI", &format!("IMAGENAME eq {}", image),
-                    "/FO", "CSV",
-                    "/NH"
-                ])
-                .output()
-            {
-                let text = String::from_utf8_lossy(&output.stdout);
-                for line in text.lines() {
-                    let parts: Vec<&str> = line.split(',').collect();
-                    if parts.len() >= 2 {
-                        let pid = parts[1].trim().trim_matches('"');
-                        if pid.is_empty() { continue; }
-                        let _ = Command::new("taskkill").args(&["/F", "/T", "/PID", pid]).output();
-                        log(&format!("Nuclear killed {} PID {} for user {}", image, pid, username));
-                    }
-                }
-            }
-        }
+    if killed > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
-
-    std::thread::sleep(std::time::Duration::from_millis(800));
-    log("Nuclear kill complete");
-}
-
-fn backend_script_for(macro_name: &str) -> &'static str {
-    match macro_name {
-        "juzo" => "juzo.py",
-        _      => "backend.pyc",
-    }
+    killed
 }
 
 #[cfg_attr(debug_assertions, allow(dead_code))]
-fn spawn_backend_process(app: &AppHandle, launcher_pid: u32, script_name: &str) -> Child {
+fn spawn_backend_process(app: &AppHandle, launcher_pid: u32) -> Result<Child, String> {
     let res_dir = normalize_path(&resource_dir(app));
     let python_exe = res_dir.join("Python314").join("pythonw.exe");
-    let script = res_dir.join(script_name);
+    let script = res_dir.join("backend.pyc");
 
     log(&format!("Python exe: {:?} (exists: {})", python_exe, python_exe.exists()));
     log(&format!("Script:     {:?} (exists: {})", script, script.exists()));
 
-    if !python_exe.exists() { panic!("Python executable not found at: {:?}", python_exe); }
-    if !script.exists() { panic!("Backend script not found at: {:?}", script); }
+    if !python_exe.exists() {
+        return Err(format!("Python executable not found at {python_exe:?}"));
+    }
+    if !script.exists() {
+        return Err(format!("Backend script not found at {script:?}"));
+    }
 
     let prod_logs = res_dir.join("logs");
     let _ = fs::create_dir_all(&prod_logs);
-
-    let log_stem = script_name.trim_end_matches(".py");
-    let stdout_file = fs::File::create(prod_logs.join(format!("{log_stem}_stdout.txt"))).expect("Failed to create stdout log");
-    let stderr_file = fs::File::create(prod_logs.join(format!("{log_stem}_stderr.txt"))).expect("Failed to create stderr log");
+    let stdout_file = fs::File::create(prod_logs.join("backend_stdout.txt")).map_err(|e| e.to_string())?;
+    let stderr_file = fs::File::create(prod_logs.join("backend_stderr.txt")).map_err(|e| e.to_string())?;
 
     Command::new(&python_exe)
         .arg(&script)
@@ -189,7 +130,7 @@ fn spawn_backend_process(app: &AppHandle, launcher_pid: u32, script_name: &str) 
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn backend ({script_name}): {e}"))
+        .map_err(|e| format!("Failed to spawn backend: {e}"))
 }
 
 // Dev builds prefer the project's .venv so the backend never runs under a Python missing its packages
@@ -202,6 +143,12 @@ fn dev_python() -> PathBuf {
     }
     log("dev_python: .venv not found, falling back to python on PATH");
     PathBuf::from(if cfg!(target_os = "windows") { "python" } else { "python3" })
+}
+
+// Dev runs the source directly, so an edit to backend.py only needs an app restart, not a recompile
+#[cfg(debug_assertions)]
+fn dev_backend_script() -> &'static str {
+    if PathBuf::from("backend.py").exists() { "backend.py" } else { "backend.pyc" }
 }
 
 fn read_backend_port(res_dir: &PathBuf, pid: u32) -> u16 {
@@ -218,8 +165,7 @@ fn read_backend_port(res_dir: &PathBuf, pid: u32) -> u16 {
                 }
             }
         }
-        log(&format!("Port file not ready (attempt {attempt}/100), retrying..."));
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
     log("WARNING: Could not read port file, falling back to 8765");
@@ -237,9 +183,9 @@ fn local_agent() -> &'static ureq::Agent {
     })
 }
 
-fn fetch_state(port: u16) -> Option<serde_json::Value> {
+fn fetch_live_state(port: u16) -> Option<serde_json::Value> {
     local_agent()
-        .get(&format!("http://127.0.0.1:{port}/state"))
+        .get(&format!("http://127.0.0.1:{port}/state?live=1"))
         .call()
         .ok()?
         .into_json()
@@ -248,13 +194,12 @@ fn fetch_state(port: u16) -> Option<serde_json::Value> {
 
 fn wait_for_backend(port: u16) -> bool {
     log(&format!("Waiting for backend on port {port}..."));
-    for i in 0..30 {
-        std::thread::sleep(std::time::Duration::from_millis(500));
+    for i in 0..60 {
         if local_agent().get(&format!("http://127.0.0.1:{port}/health")).call().is_ok() {
             log(&format!("Backend ready after {} attempts", i + 1));
             return true;
         }
-        log(&format!("Health check attempt {}/{}", i + 1, 30));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
     log("Backend failed to start in time");
     false
@@ -264,7 +209,6 @@ fn store_child(app: &AppHandle, child: Child) {
     if let Some(proc) = app.try_state::<PythonProcess>() {
         if let Ok(mut guard) = proc.0.lock() {
             *guard = Some(child);
-            log("Child process stored successfully");
         }
     }
 }
@@ -273,28 +217,16 @@ fn publish_backend_port(app: &AppHandle, port: u16) {
     if let Some(p) = app.try_state::<BackendPort>() {
         if let Ok(mut g) = p.0.lock() {
             *g = port;
-            log(&format!("BackendPort state updated to {port}"));
         }
     }
 
     let payload = serde_json::json!({ "port": port });
-    for label in &["fish", "hub", "stats", "juzo"] {
+    for label in &["fish", "stats"] {
         if let Some(win) = app.get_webview_window(label) {
             if let Err(e) = win.emit("backend-port-ready", &payload) {
                 log(&format!("Failed to emit backend-port-ready to {label}: {e}"));
-            } else {
-                log(&format!("Emitted backend-port-ready ({port}) to {label}"));
             }
-        }
-    }
-
-    for label in &["fish", "hub", "stats", "juzo"] {
-        if let Some(win) = app.get_webview_window(label) {
-            let _ = win.eval(&format!(
-                "window.__BACKEND_PORT__ = {}; window.__LAUNCHER_PID__ = '{}';",
-                port,
-                std::process::id()
-            ));
+            let _ = win.eval(&format!("window.__BACKEND_PORT__ = {port};"));
         }
     }
 }
@@ -307,7 +239,7 @@ fn terminate_child(app: &AppHandle) {
                 #[cfg(target_os = "windows")]
                 {
                     let pid = child.id();
-                    let _ = Command::new("taskkill").args(&["/F", "/T", "/PID", &pid.to_string()]).output();
+                    let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
@@ -329,9 +261,6 @@ fn terminate_child(app: &AppHandle) {
                         Err(e) => { log(&format!("Error waiting for child: {e}")); break; }
                     }
                 }
-                log("Child process terminated");
-            } else {
-                log("WARNING: No stored child process to terminate");
             }
         }
     }
@@ -339,22 +268,13 @@ fn terminate_child(app: &AppHandle) {
 
 fn full_shutdown(app: &AppHandle, launcher_pid: u32, res_dir: &PathBuf) {
     terminate_child(app);
-    kill_all_backend_processes(launcher_pid);
-    cleanup_port_file(res_dir, launcher_pid);
-}
-
-fn cleanup_port_file(res_dir: &PathBuf, pid: u32) {
-    let res_dir = normalize_path(res_dir);
-    let port_file = res_dir.join(format!("port_{pid}.json"));
+    kill_backend_processes();
+    let port_file = normalize_path(res_dir).join(format!("port_{launcher_pid}.json"));
     let _ = fs::remove_file(&port_file);
-    log(&format!("Cleaned up port file for PID {pid}"));
 }
 
-#[allow(unused_variables)]
-fn setup_main_window(app: &AppHandle, backend_port: u16, launcher_pid: u32) {
-    let Some(win) = app.get_webview_window("fish") else { return };
-
-    let store = tauri_plugin_store::StoreBuilder::new(app, "main_window.json")
+fn restore_window(app: &AppHandle, win: &tauri::WebviewWindow, store_name: &'static str) {
+    let store = tauri_plugin_store::StoreBuilder::new(app, store_name)
         .build()
         .expect("Failed to build store");
 
@@ -366,12 +286,9 @@ fn setup_main_window(app: &AppHandle, backend_port: u16, launcher_pid: u32) {
         store.get("x").and_then(|v: serde_json::Value| v.as_i64()),
         store.get("y").and_then(|v: serde_json::Value| v.as_i64()),
     ) {
-        let safe_w = w.max(400.0);
-        let safe_h = h.max(300.0);
         if is_position_visible(x, y, app) {
-            let _ = win.set_size(tauri::LogicalSize::new(safe_w, safe_h));
+            let _ = win.set_size(tauri::LogicalSize::new(w.max(400.0), h.max(300.0)));
             let _ = win.set_position(tauri::LogicalPosition::new(x as f64, y as f64));
-            log(&format!("main window: restored size={safe_w}x{safe_h} pos={x},{y}"));
             restored = true;
         } else {
             log("main window: saved position off-screen, using default");
@@ -386,7 +303,6 @@ fn setup_main_window(app: &AppHandle, backend_port: u16, launcher_pid: u32) {
             let height = (msize.height as f64 / scale * 0.475) as u32;
             let _ = win.set_size(tauri::LogicalSize::new(width, height));
             let _ = win.center();
-            log("main window: using default size");
         }
     }
 
@@ -396,77 +312,7 @@ fn setup_main_window(app: &AppHandle, backend_port: u16, launcher_pid: u32) {
             if let (Ok(size), Ok(pos)) = (win_clone.inner_size(), win_clone.outer_position()) {
                 if let Ok(Some(monitor)) = win_clone.current_monitor() {
                     let scale = monitor.scale_factor();
-                    if let Ok(store) = tauri_plugin_store::StoreBuilder::new(win_clone.app_handle(), "main_window.json").build() {
-                        store.set("w", serde_json::json!(size.width as f64 / scale));
-                        store.set("h", serde_json::json!(size.height as f64 / scale));
-                        store.set("x", serde_json::json!(pos.x));
-                        store.set("y", serde_json::json!(pos.y));
-                        let _ = store.save();
-                    }
-                }
-            }
-        }
-    });
-
-    let win_clone2 = win.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            if let Some(state) = fetch_state(backend_port) {
-                if let Some(on_top) = state.get("alwaysOnTop").and_then(|v| v.as_bool()) {
-                    let _ = win_clone2.set_always_on_top(on_top);
-                }
-            }
-        }
-    });
-}
-
-fn setup_juzo_window(app: &AppHandle) {
-    let Some(win) = app.get_webview_window("juzo") else { return };
-
-    let store = tauri_plugin_store::StoreBuilder::new(app, "juzo_window.json")
-        .build()
-        .expect("Failed to build store");
-
-    let mut restored = false;
-
-    if let (Some(w), Some(h), Some(x), Some(y)) = (
-        store.get("w").and_then(|v: serde_json::Value| v.as_f64()),
-        store.get("h").and_then(|v: serde_json::Value| v.as_f64()),
-        store.get("x").and_then(|v: serde_json::Value| v.as_i64()),
-        store.get("y").and_then(|v: serde_json::Value| v.as_i64()),
-    ) {
-        let safe_w = w.max(400.0);
-        let safe_h = h.max(300.0);
-        if is_position_visible(x, y, app) {
-            let _ = win.set_size(tauri::LogicalSize::new(safe_w, safe_h));
-            let _ = win.set_position(tauri::LogicalPosition::new(x as f64, y as f64));
-            log(&format!("juzo window: restored size={safe_w}x{safe_h} pos={x},{y}"));
-            restored = true;
-        } else {
-            log("juzo window: saved position off-screen, using default");
-        }
-    }
-
-    if !restored {
-        if let Ok(Some(monitor)) = win.current_monitor() {
-            let scale  = monitor.scale_factor();
-            let msize  = monitor.size();
-            let width  = (msize.width  as f64 / scale * 0.365) as u32;
-            let height = (msize.height as f64 / scale * 0.475) as u32;
-            let _ = win.set_size(tauri::LogicalSize::new(width, height));
-            let _ = win.center();
-            log("juzo window: using default size");
-        }
-    }
-
-    let win_clone = win.clone();
-    win.on_window_event(move |event| {
-        if let tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_) = event {
-            if let (Ok(size), Ok(pos)) = (win_clone.inner_size(), win_clone.outer_position()) {
-                if let Ok(Some(monitor)) = win_clone.current_monitor() {
-                    let scale = monitor.scale_factor();
-                    if let Ok(store) = tauri_plugin_store::StoreBuilder::new(win_clone.app_handle(), "juzo_window.json").build() {
+                    if let Ok(store) = tauri_plugin_store::StoreBuilder::new(win_clone.app_handle(), store_name).build() {
                         store.set("w", serde_json::json!(size.width as f64 / scale));
                         store.set("h", serde_json::json!(size.height as f64 / scale));
                         store.set("x", serde_json::json!(pos.x));
@@ -479,7 +325,7 @@ fn setup_juzo_window(app: &AppHandle) {
     });
 }
 
-fn setup_stats_window(app: &AppHandle, backend_port: u16) {
+fn setup_stats_window(app: &AppHandle) {
     let Some(stats_win) = app.get_webview_window("stats") else { return };
 
     let store = tauri_plugin_store::StoreBuilder::new(app, "stats_position.json")
@@ -490,7 +336,7 @@ fn setup_stats_window(app: &AppHandle, backend_port: u16) {
         let scale  = monitor.scale_factor();
         let msize  = monitor.size();
         let default_width  = (msize.width  as f64 / scale * 0.125) as u32;
-        let default_height = (msize.height as f64 / scale * 0.135) as u32 + 6;
+        let default_height = (msize.height as f64 / scale * 0.16) as u32;
         let saved_w = store.get("w").and_then(|v: serde_json::Value| v.as_f64());
         let saved_h = store.get("h").and_then(|v: serde_json::Value| v.as_f64());
         let (width, height) = match (saved_w, saved_h) {
@@ -503,12 +349,10 @@ fn setup_stats_window(app: &AppHandle, backend_port: u16) {
         match (saved_x, saved_y) {
             (Some(x), Some(y)) if is_position_visible(x, y, app) => {
                 let _ = stats_win.set_position(PhysicalPosition::new(x as i32, y as i32));
-                log(&format!("stats window: restored pos={x},{y}"));
             }
             _ => {
-                let x = ((msize.width as i32) - (width as f64 * scale) as i32) / 2;
-                let _ = stats_win.set_position(PhysicalPosition::new(x, 20));
-                log("stats window: using default position");
+                // Top-left by default: GPO's catch notices (which fruit detection reads) sit top-centre
+                let _ = stats_win.set_position(PhysicalPosition::new(20, (msize.height as f64 * 0.25) as i32));
             }
         }
     }
@@ -536,16 +380,40 @@ fn setup_stats_window(app: &AppHandle, backend_port: u16) {
             _ => {}
         }
     });
+}
 
+// One watcher for both window behaviours that follow backend settings: the main window's always-on-top and the
+// overlay, which is only shown while the macro runs. Windows are only touched when a value actually changes
+fn start_window_watcher(app: &AppHandle, backend_port: u16) {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let app = app.clone();
     std::thread::spawn(move || {
+        let mut last_on_top: Option<bool> = None;
+        let mut last_show_overlay: Option<bool> = None;
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-            if let Some(state) = fetch_state(backend_port) {
-                // Only show the overlay while the macro is actually running
-                let enabled = state.get("showDebugOverlay").and_then(|v| v.as_bool()).unwrap_or(false);
-                let running = state.get("isRunning").and_then(|v| v.as_bool()).unwrap_or(false);
-                let show = enabled && running;
-                if show { let _ = stats_win.show(); } else { let _ = stats_win.hide(); }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let Some(state) = fetch_live_state(backend_port) else { continue };
+
+            let on_top = state.get("alwaysOnTop").and_then(|v| v.as_bool()).unwrap_or(false);
+            if last_on_top != Some(on_top) {
+                if let Some(win) = app.get_webview_window("fish") {
+                    let _ = win.set_always_on_top(on_top);
+                }
+                last_on_top = Some(on_top);
+            }
+
+            let enabled = state.get("showDebugOverlay").and_then(|v| v.as_bool()).unwrap_or(false);
+            let running = state.get("isRunning").and_then(|v| v.as_bool()).unwrap_or(false);
+            let show_overlay = enabled && running;
+            if last_show_overlay != Some(show_overlay) {
+                if let Some(stats) = app.get_webview_window("stats") {
+                    let _ = if show_overlay { stats.show() } else { stats.hide() };
+                }
+                last_show_overlay = Some(show_overlay);
             }
         }
     });
@@ -553,207 +421,75 @@ fn setup_stats_window(app: &AppHandle, backend_port: u16) {
 
 #[tauri::command]
 fn get_backend_port(app: AppHandle) -> u16 {
-    let port = app
-        .try_state::<BackendPort>()
+    app.try_state::<BackendPort>()
         .and_then(|p| p.0.lock().ok().map(|g| *g))
-        .unwrap_or(8765);
-    log(&format!("get_backend_port called, returning {port}"));
-    port
-}
-
-#[tauri::command]
-fn send_to_python(app: AppHandle, action: String, payload: String) -> Result<String, String> {
-    let port = app
-        .try_state::<BackendPort>()
-        .and_then(|p| p.0.lock().ok().map(|g| *g))
-        .unwrap_or(8765);
-
-    local_agent()
-        .post(&format!("http://127.0.0.1:{port}/command"))
-        .send_json(serde_json::json!({ "action": action, "payload": payload }))
-        .map(|_| "Success".to_string())
-        .map_err(|e| e.to_string())
+        .unwrap_or(8765)
 }
 
 #[tauri::command]
 fn get_system_info() -> serde_json::Value {
     let mut sys = System::new();
     sys.refresh_memory();
-    let available_bytes = sys.available_memory();
-    let available_gb = available_bytes as f64 / 1_073_741_824.0;
+    let available_gb = sys.available_memory() as f64 / 1_073_741_824.0;
     serde_json::json!({ "ram_available_gb": (available_gb * 10.0).round() / 10.0 })
 }
 
 #[tauri::command]
-fn kill_conflicting_processes(app: AppHandle) -> serde_json::Value {
-    let mut killed: u32 = 0;
-    let own_pid = std::process::id().to_string();
-    let res_dir = normalize_path(&resource_dir(&app));
-    let res_dir_str = res_dir.to_string_lossy().to_lowercase();
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(output) = Command::new("wmic")
-            .args(&["process", "get", "ProcessId,Name,ExecutablePath", "/FORMAT:CSV"])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() < 4 { continue; }
-                let exe_path = parts[1].trim().to_lowercase();
-                let name     = parts[2].trim().to_lowercase();
-                let pid_str  = parts[3].trim();
-                if pid_str == own_pid { continue; }
-                if exe_path.is_empty() { continue; }
-                let in_our_dir = exe_path.starts_with(&res_dir_str);
-                let is_target  = name.starts_with("python") || name.starts_with("gpo");
-                if in_our_dir && is_target && !pid_str.is_empty() {
-                    let _ = Command::new("taskkill").args(&["/F", "/PID", pid_str]).output();
-                    log(&format!("Killed process {pid_str} ({name}) from {exe_path}"));
-                    killed += 1;
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(600));
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        for pattern in &["python", "gpo"] {
-            if let Ok(output) = Command::new("pgrep").args(&["-i", "-l", pattern]).output() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                for line in text.lines() {
-                    let mut parts = line.split_whitespace();
-                    let (Some(pid), Some(_name)) = (parts.next(), parts.next()) else { continue };
-                    if pid == own_pid { continue; }
-                    if let Ok(exe_link) = fs::read_link(format!("/proc/{pid}/exe")) {
-                        let exe_str = exe_link.to_string_lossy().to_lowercase();
-                        if exe_str.starts_with(&res_dir_str) {
-                            let _ = Command::new("kill").args(&["-9", pid]).output();
-                            killed += 1;
-                        }
-                    }
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(400));
-    }
-
+fn kill_conflicting_processes() -> serde_json::Value {
+    let killed = kill_backend_processes();
     log(&format!("kill_conflicting_processes: terminated {killed} process(es)"));
     serde_json::json!({ "killed": killed })
 }
 
 #[tauri::command]
-fn reset_window_position(app: AppHandle) -> Result<(), String> {
-    let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let _ = fs::remove_file(app_dir.join("main_window.json"));
-    let _ = fs::remove_file(app_dir.join("stats_position.json"));
-    let _ = fs::remove_file(app_dir.join("juzo_window.json"));
-    log("Window position data reset");
-    Ok(())
-}
-
-#[tauri::command]
 fn launch_macro(app: AppHandle, macro_name: String) -> Result<serde_json::Value, String> {
+    if macro_name != "fishing" {
+        return Err(format!("Unknown macro '{macro_name}'"));
+    }
+
     let launcher_pid = std::process::id();
     let res_dir = resource_dir(&app);
-    let script_name = backend_script_for(&macro_name);
 
-    log(&format!("launch_macro: {macro_name} -> {script_name}"));
-
-    kill_existing_backend();
+    kill_backend_processes();
 
     #[cfg(debug_assertions)]
     {
-        let python_cmd = dev_python();
-        let child = Command::new(python_cmd)
-            .arg(script_name)
+        let script = dev_backend_script();
+        let child = Command::new(dev_python())
+            .arg(script)
             .arg("--pid")
             .arg(launcher_pid.to_string())
             .spawn()
-            .map_err(|e| format!("Failed to start debug backend ({script_name}): {e}"))?;
-        log(&format!("DEBUG: {script_name} spawned via launch_macro"));
+            .map_err(|e| format!("Failed to start debug backend ({script}): {e}"))?;
+        log(&format!("DEBUG: {script} spawned"));
         store_child(&app, child);
     }
 
     #[cfg(not(debug_assertions))]
     {
-        let child = spawn_backend_process(&app, launcher_pid, script_name);
+        let child = spawn_backend_process(&app, launcher_pid)?;
         store_child(&app, child);
     }
 
     let port = read_backend_port(&res_dir, launcher_pid);
-
     if !wait_for_backend(port) {
         return Err("Backend did not start in time".to_string());
     }
 
     publish_backend_port(&app, port);
 
-    match macro_name.as_str() {
-        "fishing" => {
-            if let Some(hub) = app.get_webview_window("hub") {
-                let _ = hub.hide();
-            }
-            if let Some(win) = app.get_webview_window("fish") {
-                win.show().map_err(|e| e.to_string())?;
-                win.set_focus().map_err(|e| e.to_string())?;
-                setup_main_window(&app, port, launcher_pid);
-                setup_stats_window(&app, port);
-            }
-        }
-        "juzo" => {
-            if let Some(hub) = app.get_webview_window("hub") {
-                let _ = hub.hide();
-            }
-            if let Some(win) = app.get_webview_window("juzo") {
-                win.show().map_err(|e| e.to_string())?;
-                win.set_focus().map_err(|e| e.to_string())?;
-                setup_juzo_window(&app);
-            }
-        }
-        _ => {
-            log(&format!("launch_macro: no window configured for '{macro_name}'"));
-        }
+    if let Some(hub) = app.get_webview_window("hub") {
+        let _ = hub.hide();
+    }
+    if let Some(win) = app.get_webview_window("fish") {
+        win.show().map_err(|e| e.to_string())?;
+        win.set_focus().map_err(|e| e.to_string())?;
+        restore_window(&app, &win, "main_window.json");
+        setup_stats_window(&app);
+        start_window_watcher(&app, port);
     }
 
     log(&format!("launch_macro: done, port {port}"));
-    Ok(serde_json::json!({ "port": port }))
-}
-
-#[tauri::command]
-fn start_backend(app: AppHandle) -> Result<serde_json::Value, String> {
-    let launcher_pid = std::process::id();
-    let res_dir = resource_dir(&app);
-
-    kill_existing_backend();
-
-    #[cfg(debug_assertions)]
-    {
-        let python_cmd = dev_python();
-        let child = Command::new(python_cmd)
-            .arg("backend.pyc")
-            .arg("--pid")
-            .arg(launcher_pid.to_string())
-            .spawn()
-            .map_err(|e| format!("Failed to start debug backend: {e}"))?;
-        store_child(&app, child);
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        let child = spawn_backend_process(&app, launcher_pid, "backend.py");
-        store_child(&app, child);
-    }
-
-    let port = read_backend_port(&res_dir, launcher_pid);
-    if !wait_for_backend(port) {
-        return Err("Backend did not start in time".to_string());
-    }
-
-    publish_backend_port(&app, port);
-
     Ok(serde_json::json!({ "port": port }))
 }
 
@@ -763,115 +499,20 @@ fn open_main_window(app: AppHandle) -> Result<(), String> {
         hub.show().map_err(|e| e.to_string())?;
         hub.set_focus().map_err(|e| e.to_string())?;
     }
-
     if let Some(launcher) = app.get_webview_window("launcher") {
         let _ = launcher.close();
     }
-
-    log("open_main_window: hub shown, launcher closed");
     Ok(())
-}
-
-struct KeyAuthApp {
-    name: &'static str,
-    ownerid: &'static str,
-}
-
-fn keyauth_app_for(macro_name: &str) -> Option<KeyAuthApp> {
-    match macro_name {
-        "fishing" => None,
-        "juzo"    => Some(KeyAuthApp { name: "K's Juzo Macro",   ownerid: "5ZmAhBPrGX" }),
-        "mihawk"  => Some(KeyAuthApp { name: "K's Mihawk Macro", ownerid: "5ZmAhBPrGX" }),
-        "roger"   => Some(KeyAuthApp { name: "K's Roger Macro",  ownerid: "5ZmAhBPrGX" }),
-        _         => None,
-    }
-}
-
-#[tauri::command]
-fn get_saved_key(app: AppHandle, macro_name: String) -> Option<String> {
-    let store = tauri_plugin_store::StoreBuilder::new(&app, "keys.json").build().ok()?;
-    store.get(&macro_name).and_then(|v: serde_json::Value| v.as_str().map(|s| s.to_string()))
-}
-
-#[tauri::command]
-fn keyauth_verify(app: AppHandle, key: String, macro_name: String) -> Result<serde_json::Value, String> {
-    log(&format!("keyauth_verify: key=*** macro={macro_name}"));
-
-    let ka = match keyauth_app_for(&macro_name) {
-        Some(k) => k,
-        None => {
-            log(&format!("keyauth_verify: {macro_name} is free, skipping"));
-            return Ok(serde_json::json!({ "success": true, "free": true }));
-        }
-    };
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {e}"))?;
-
-    let params = [("type", "init"), ("name", ka.name), ("ownerid", ka.ownerid), ("ver", "1.0")];
-
-    let init_raw = client
-        .post("https://keyauth.win/api/1.2/")
-        .form(&params)
-        .send()
-        .map_err(|e| format!("Init request failed: {e}"))?
-        .text()
-        .map_err(|e| format!("Init read failed: {e}"))?;
-
-    log(&format!("KeyAuth init raw: {init_raw}"));
-
-    let init_res: serde_json::Value = serde_json::from_str(&init_raw)
-        .map_err(|e| format!("Init parse failed: {e} — raw: [{init_raw}]"))?;
-
-    if !init_res.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let msg = init_res.get("message").and_then(|v| v.as_str()).unwrap_or("Init failed");
-        log(&format!("KeyAuth init failed: {msg}"));
-        return Err(msg.to_string());
-    }
-
-    let session_id = init_res.get("sessionid").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    log(&format!("KeyAuth init success, sessionid={session_id}"));
-
-    let license_params = [
-        ("type", "license"), ("key", key.as_str()), ("name", ka.name),
-        ("ownerid", ka.ownerid), ("sessionid", session_id.as_str()),
-    ];
-
-    let license_raw = client
-        .post("https://keyauth.win/api/1.2/")
-        .form(&license_params)
-        .send()
-        .map_err(|e| format!("License request failed: {e}"))?
-        .text()
-        .map_err(|e| format!("License read failed: {e}"))?;
-
-    log(&format!("KeyAuth license raw: {license_raw}"));
-
-    let license_res: serde_json::Value = serde_json::from_str(&license_raw)
-        .map_err(|e| format!("License parse failed: {e} — raw: [{license_raw}]"))?;
-
-    let success = license_res.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    if success {
-        if let Ok(store) = tauri_plugin_store::StoreBuilder::new(&app, "keys.json").build() {
-            store.set(macro_name.clone(), serde_json::json!(key));
-            let _ = store.save();
-        }
-        log("KeyAuth license verified, key saved");
-        Ok(serde_json::json!({ "success": true }))
-    } else {
-        let msg = license_res.get("message").and_then(|v| v.as_str()).unwrap_or("Invalid or expired key");
-        log(&format!("KeyAuth license failed: {msg}"));
-        Err(msg.to_string())
-    }
 }
 
 #[tauri::command]
 fn open_browser(url: String) -> Result<(), String> {
+    // Only web links: this goes through the shell, so anything else could launch a local program
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("Only http(s) links can be opened".to_string());
+    }
     #[cfg(target_os = "windows")]
-    Command::new("cmd").args(&["/C", "start", "", &url]).spawn().map_err(|e| e.to_string())?;
+    Command::new("cmd").args(["/C", "start", "", &url]).spawn().map_err(|e| e.to_string())?;
     #[cfg(target_os = "macos")]
     Command::new("open").arg(&url).spawn().map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
@@ -889,18 +530,16 @@ fn main() {
         .manage(PythonProcess(Mutex::new(None)))
         .manage(BackendPort(Mutex::new(0_u16)))
         .setup(move |app| {
-            log("Setup running");
             if let Some(win) = app.get_webview_window("launcher") {
                 let _ = win.show();
                 let _ = win.set_focus();
             }
-            log("Setup complete");
             Ok(())
         })
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let label = window.label();
-                if label == "fish" || label == "hub" || label == "juzo" {
+                if label == "fish" || label == "hub" {
                     api.prevent_close();
                     let app_handle = window.app_handle().clone();
                     let res_dir = resource_dir(&app_handle);
@@ -918,14 +557,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_backend_port,
             frontend_log,
-            send_to_python,
             kill_conflicting_processes,
-            reset_window_position,
-            start_backend,
             launch_macro,
             open_main_window,
-            keyauth_verify,
-            get_saved_key,
             open_browser,
             get_system_info,
         ])

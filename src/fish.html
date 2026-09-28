@@ -90,14 +90,6 @@
           </svg>
           Logging
         </button>
-        <button class="nav-btn" data-view="devices">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="2" y="3" width="20" height="14" rx="2" />
-            <line x1="8" y1="21" x2="16" y2="21" />
-            <line x1="12" y1="17" x2="12" y2="21" />
-          </svg>
-          Devices
-        </button>
         <button class="nav-btn" data-view="settings">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3" />
@@ -115,10 +107,7 @@
         </div>
         <div class="status-detail" id="macroStatusText" title="What the macro is doing right now">Idle</div>
         <div class="status-detail"><span class="status-fish" id="macroFishText">0 fish · 0 fruit</span></div>
-        <div class="rdp-pill" id="rdpIndicator">
-          <span class="rdp-dot"></span>
-          <span id="rdpText">Local</span>
-        </div>
+        <button class="btn-primary sidebar-toggle" id="macroToggleBtn" onclick="toggleMacro()" title="Same as the Start / Stop hotkey">Start</button>
       </div>
     </aside>
 
@@ -144,6 +133,22 @@
             <i class="fab fa-google"></i>
             <span>Help</span>
           </a>
+        </div>
+
+        <div class="section-title">
+          Session
+          <button class="btn-sm inline-btn" onclick="resetStats()">Reset Stats</button>
+        </div>
+        <div class="panel">
+          <div class="stat-grid">
+            <div class="stat-tile"><span class="stat-value" id="dashFish">0</span><span class="stat-label">Fish caught</span></div>
+            <div class="stat-tile"><span class="stat-value" id="dashFruits">0</span><span class="stat-label">Devil fruits</span></div>
+            <div class="stat-tile"><span class="stat-value" id="dashRate">0.0</span><span class="stat-label">Fish / hour</span></div>
+            <div class="stat-tile"><span class="stat-value" id="dashTime">0:00:00</span><span class="stat-label">Fishing time</span></div>
+          </div>
+          <div class="rarity-row" id="dashRarity"></div>
+          <div class="fruit-history" id="dashFruitHistory"><div class="empty-msg">No devil fruits yet this session</div></div>
+          <div class="row-hint">Fruits are counted from GPO's "YOU GOT A DEVIL FRUIT DROP" notice. The rarity comes from the legendary pity counter (a reset to 0 means legendary); "Other" is a non-legendary drop whose exact rarity the notice doesn't show. A name is filled in when the "New Item" popup names the fruit.</div>
         </div>
 
         <div class="section-title">Setup Checklist</div>
@@ -240,23 +245,6 @@
                 <option selected>2</option>
                 <option>3</option>
                 <option>4</option>
-                <option>5</option>
-                <option>6</option>
-                <option>7</option>
-                <option>8</option>
-                <option>9</option>
-                <option>0</option>
-              </select>
-            </div>
-          </div>
-          <div class="row-item">
-            <span class="row-label">Brew Inventory Slot</span>
-            <div class="row-ctrl">
-              <select class="sel" id="potionBrewSlot" onchange="sendToPython('set_potion_brew_slot', this.value)">
-                <option>1</option>
-                <option>2</option>
-                <option>3</option>
-                <option selected>4</option>
                 <option>5</option>
                 <option>6</option>
                 <option>7</option>
@@ -400,86 +388,6 @@
           </div>
         </div>
 
-        <div class="section-title">Crafting Interface</div>
-        <div class="panel">
-          <div class="row-item"><span class="row-label">Left Dialog</span>
-            <div class="row-ctrl"><span class="point-badge unset" id="craftLeftPointStatus">Not Set</span><button
-                class="btn-sm" onclick="sendToPython('set_craft_left_point','')">Set</button></div>
-          </div>
-          <div class="row-item"><span class="row-label">Middle Dialog</span>
-            <div class="row-ctrl"><span class="point-badge unset" id="craftMiddlePointStatus">Not Set</span><button
-                class="btn-sm" onclick="sendToPython('set_craft_middle_point','')">Set</button></div>
-          </div>
-          <div class="row-item"><span class="row-label">Add Ingredient</span>
-            <div class="row-ctrl"><span class="point-badge unset" id="addRecipePointStatus">Not Set</span><button
-                class="btn-sm" onclick="sendToPython('set_add_recipe_point','')">Set</button></div>
-          </div>
-          <div class="row-item"><span class="row-label">Top Recipe Slot</span>
-            <div class="row-ctrl"><span class="point-badge unset" id="topRecipePointStatus">Not Set</span><button
-                class="btn-sm" onclick="sendToPython('set_top_recipe_point','')">Set</button></div>
-          </div>
-          <div class="row-item"><span class="row-label">Craft Confirm</span>
-            <div class="row-ctrl"><span class="point-badge unset" id="craftButtonPointStatus">Not Set</span><button
-                class="btn-sm" onclick="sendToPython('set_craft_button_point','')">Set</button></div>
-          </div>
-          <div class="row-item"><span class="row-label">Craft Selected</span>
-            <div class="row-ctrl"><span class="point-badge unset" id="craftConfirmPointStatus">Not Set</span><button
-                class="btn-sm" onclick="sendToPython('set_craft_confirm_point','')">Set</button></div>
-          </div>
-          <div class="row-item"><span class="row-label">Menu Close</span>
-            <div class="row-ctrl"><span class="point-badge unset" id="closeMenuPointStatus">Not Set</span><button
-                class="btn-sm" onclick="sendToPython('set_close_menu_point','')">Set</button></div>
-          </div>
-          <div class="row-hint">Set "Craft Selected" to the right of the green button to avoid clicking wrong recipes.
-          </div>
-        </div>
-
-        <div class="section-title">
-          Crafting Recipes
-          <button class="btn-sm inline-btn" onclick="addNewRecipe()">+ Add Recipe</button>
-        </div>
-        <div id="RecipesContainer"></div>
-
-        <div class="section-title">Fish Sell Shop</div>
-        <div class="panel">
-          <div class="row-item">
-            <span class="row-label">Left Dialog Point</span>
-            <div class="row-ctrl">
-              <span class="point-badge unset" id="sellLeftPointStatus">Not Set</span>
-              <button class="btn-sm" onclick="sendToPython('set_sell_left_point','')">Set</button>
-            </div>
-          </div>
-          <div class="row-item">
-            <span class="row-label">Middle Dialog Point</span>
-            <div class="row-ctrl">
-              <span class="point-badge unset" id="sellMiddlePointStatus">Not Set</span>
-              <button class="btn-sm" onclick="sendToPython('set_sell_middle_point','')">Set</button>
-            </div>
-          </div>
-          <div class="row-item">
-            <span class="row-label">Select Top Fish Point</span>
-            <div class="row-ctrl">
-              <span class="point-badge unset" id="sellSelectTopPointStatus">Not Set</span>
-              <button class="btn-sm" onclick="sendToPython('set_sell_select_top_point','')">Set</button>
-            </div>
-          </div>
-          <div class="row-item">
-            <span class="row-label">Accept Button Point</span>
-            <div class="row-ctrl">
-              <span class="point-badge unset" id="sellAcceptPointStatus">Not Set</span>
-              <button class="btn-sm" onclick="sendToPython('set_sell_accept_point','')">Set</button>
-            </div>
-          </div>
-          <div class="row-item">
-            <span class="row-label">Close Shop Point</span>
-            <div class="row-ctrl">
-              <span class="point-badge unset" id="sellClosePointStatus">Not Set</span>
-              <button class="btn-sm" onclick="sendToPython('set_sell_close_point','')">Set</button>
-            </div>
-          </div>
-          <div class="row-hint">Configure these points before enabling Auto Sell in Automation</div>
-        </div>
-
         <div class="section-title">Devil Fruit</div>
         <div class="panel">
           <div class="row-item"><span class="row-label">Store Location</span>
@@ -547,7 +455,7 @@
                 <button class="btn-sm" onclick="testBaitScan()">Test Scan</button>
               </div>
             </div>
-            <div class="row-hint">Smart mode uses the first bait in the list while it's in stock. When it runs out, Auto Buy tries to restock it first; only if that fails (e.g. out of money) does it fall back to the next tier as insurance, and it switches back once the first bait can be bought again. The loop interval above only applies when the bait count can't be read.</div>
+            <div class="row-hint">Smart mode uses the first bait in the list that's in stock, top to bottom (default: Rare, Legendary, Common — devil fruits don't come from Common bait). Auto Buy restocks Common Fish Bait when it and everything above it have run out; if that purchase fails (e.g. out of money) it keeps fishing with whatever is left. The loop interval above only applies when the bait count can't be read.</div>
           </div>
         </div>
 
@@ -567,30 +475,6 @@
             <div class="row-item"><span class="row-label">Purchase every N loops</span>
               <div class="row-ctrl"><input type="number" class="inp" id="loopsPerPurchase" value="100" step="1"
                   onchange="sendToPython('set_loops_per_purchase',this.value)"><span class="unit">loops</span></div>
-            </div>
-          </div>
-        </div>
-
-        <div class="section-title">Auto Craft Bait</div>
-        <div class="panel">
-          <div class="row-item">
-            <span class="row-label">Enable Auto Craft</span>
-            <div class="row-ctrl">
-              <div class="toggle" id="autoCraftBaitToggle"
-                onclick="toggleExpandable('autoCraftBait','autoCraftExpand')"></div>
-            </div>
-          </div>
-          <div class="warn-box hidden" id="autoCraftBaitWarning">
-            Configure crafting points and recipes first — <a onclick="navigateToLocations()">Locations → Crafting</a>
-          </div>
-          <div class="expandable" id="autoCraftExpand">
-            <div class="row-item"><span class="row-label">Fish caught before craft</span>
-              <div class="row-ctrl"><input type="number" class="inp" id="fishCountPerCraft" value="50" step="1" min="1"
-                  onchange="sendToPython('set_fish_count_per_craft',this.value)"><span class="unit">fish</span></div>
-            </div>
-            <div class="row-item"><span class="row-label">Movement duration</span>
-              <div class="row-ctrl"><input type="number" class="inp" id="moveDuration" value="0" step="0.25"
-                  onchange="sendToPython('set_move_duration',this.value)"><span class="unit">sec</span></div>
             </div>
           </div>
         </div>
@@ -633,87 +517,21 @@
                   onchange="sendToPython('set_loops_per_store',this.value)"><span class="unit">loops</span></div>
             </div>
             <div class="row-item">
+              <span class="row-label">Drop fruits that can't be stored</span>
+              <div class="row-ctrl">
+                <div class="toggle" id="dropUnstorableFruitToggle" onclick="toggleSetting('dropUnstorableFruit')"></div>
+              </div>
+            </div>
+            <div class="row-item">
               <span class="row-label">Fruit detection</span>
               <div class="row-ctrl">
                 <span class="point-badge unset" id="fruitDetectStatus">Checking…</span>
               </div>
             </div>
-            <div class="row-hint">With "Only store when a fruit is caught" on, the rod is only swapped out after the catch popup shows a devil fruit, plus a safety sweep every N loops (0 = never) in case a popup is missed. "Store every N loops" is used instead while fruit detection is off or still loading.</div>
+            <div class="row-hint">With "Only store when a fruit is caught" on, the rod is only swapped out after the catch popup shows a devil fruit, plus a safety sweep every N loops (0 = never) in case a popup is missed. "Store every N loops" is used instead while fruit detection is off or still loading. When the game refuses a fruit (you already store one of it), it stays in its slot and that slot is skipped until the macro restarts; turn on "Drop fruits that can't be stored" to drop it instead (dropped fruits despawn after 10 minutes).</div>
           </div>
         </div>
 
-        <div class="section-title">Auto Sell Fish</div>
-        <div class="panel">
-          <div class="row-item">
-            <span class="row-label">Enable Auto Sell</span>
-            <div class="row-ctrl">
-              <div class="toggle" id="autoSellFishToggle" onclick="toggleExpandable('autoSellFish','autoSellExpand')">
-              </div>
-            </div>
-          </div>
-          <div class="warn-box hidden" id="autoSellFishWarning">
-            Set all sell points in Locations → Fish Sell Shop before enabling.
-          </div>
-          <div class="expandable" id="autoSellExpand">
-            <div class="row-item sub">
-              <span class="row-label">Repeat Sell Count</span>
-              <div class="row-ctrl">
-                <input type="number" class="inp" id="sellRepeatCount" value="3" step="1" min="1"
-                  onchange="sendToPython('set_sell_repeat_count',this.value)">
-                <span class="unit">times</span>
-              </div>
-            </div>
-            <div class="row-item sub">
-              <span class="row-label">Sell every N loops</span>
-              <div class="row-ctrl">
-                <input type="number" class="inp" id="loopsPerSell" value="50" step="1" min="1"
-                  onchange="sendToPython('set_loops_per_sell',this.value)">
-                <span class="unit">loops</span>
-              </div>
-            </div>
-          </div>
-        </div>
-        
-        <div class="section-title">Auto Use Potion Brew</div>
-        <div class="panel">
-          <div class="row-item">
-            <span class="row-label">Enable Auto Use Potions</span>
-            <div class="row-ctrl">
-              <div class="toggle" id="autoUsePotionBrewToggle"
-                onclick="toggleExpandable('autoUsePotionBrew','autoPotionBrewExpand')"></div>
-            </div>
-          </div>
-          <div class="expandable" id="autoPotionBrewExpand">
-            <div class="row-item">
-              <span class="row-label">Use every N minutes</span>
-              <div class="row-ctrl">
-                <input type="number" class="inp" id="potionBrewInterval" value="30" step="1" min="1"
-                  onchange="sendToPython('set_potion_brew_interval', this.value)">
-                <span class="unit">min</span>
-              </div>
-            </div>
-          </div>
-        </div>
-        
-        <div class="section-title">Devil Fruit Spawn Detection</div>
-        <div class="panel">
-          <div class="row-item">
-            <span class="row-label">Enable Spawn Detection</span>
-            <div class="row-ctrl">
-              <div class="toggle" id="enableSpawnDetectionToggle"
-                onclick="toggleExpandable('enableSpawnDetection','spawnDetectionExpand')"></div>
-            </div>
-          </div>
-
-          <div class="expandable" id="spawnDetectionExpand">
-            <div class="row-item"><span class="row-label">Scan interval</span>
-              <div class="row-ctrl"><input type="number" class="inp" id="spawnScanInterval" value="5.0" step="0.5"
-                  min="0.5" max="10" onchange="sendToPython('set_spawn_scan_interval',this.value)"><span
-                  class="unit">sec</span>
-                </div>
-            </div>
-          </div>
-        </div>
       </div>
 
       <div class="view" id="tuning">
@@ -879,49 +697,6 @@
           </div>
         </div>
 
-        <div class="section-title">Crafting</div>
-        <div class="panel">
-          <div class="row-item"><span class="row-label">Menu Open Delay</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="craftMenuDelay" value="0.85" step="0.05"
-                onchange="sendToPython('set_craft_menu_delay',this.value)"><span class="unit">sec</span></div>
-          </div>
-          <div class="row-item"><span class="row-label">UI Click Delay</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="craftClickDelay" value="0.5" step="0.05"
-                onchange="sendToPython('set_craft_click_delay',this.value)"><span class="unit">sec</span></div>
-          </div>
-          <div class="row-item"><span class="row-label">Recipe Selection Delay</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="craftRecipeDelay" value="0.5" step="0.05"
-                onchange="sendToPython('set_craft_recipe_delay',this.value)"><span class="unit">sec</span></div>
-          </div>
-          <div class="row-item"><span class="row-label">Add Recipe Button Delay</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="craftAddDelay" value="0.5" step="0.05"
-                onchange="sendToPython('set_craft_add_delay',this.value)"><span class="unit">sec</span></div>
-          </div>
-          <div class="row-item"><span class="row-label">Top Recipe Slot Delay</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="craftTopDelay" value="0.5" step="0.05"
-                onchange="sendToPython('set_craft_top_delay',this.value)"><span class="unit">sec</span></div>
-          </div>
-          <div class="row-item"><span class="row-label">Craft Button Click Delay</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="craftButtonDelay" value="0.025" step="0.005"
-                onchange="sendToPython('set_craft_button_delay',this.value)"><span class="unit">sec</span></div>
-          </div>
-          <div class="row-item"><span class="row-label">Close Menu Delay</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="craftCloseDelay" value="0.5" step="0.05"
-                onchange="sendToPython('set_craft_close_delay',this.value)"><span class="unit">sec</span></div>
-          </div>
-        </div>
-
-        <div class="section-title">Potion Brew</div>
-        <div class="panel">
-          <div class="row-item"><span class="row-label">Equip Delay</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="brewEquipDelay" value="0.3" step="0.05"
-                onchange="sendToPython('set_brew_equip_delay', this.value)"><span class="unit">sec</span></div>
-          </div>
-          <div class="row-item"><span class="row-label">Use Delay</span>
-            <div class="row-ctrl"><input type="number" class="inp" id="brewUseDelay" value="4.5" step="0.05"
-                onchange="sendToPython('set_brew_use_delay', this.value)"><span class="unit">sec</span></div>
-          </div>
-        </div>
       </div>
 
       <div class="view" id="logging">
@@ -954,7 +729,7 @@
         <div class="panel">
           <div class="notif-row">
             <div class="notif-main">
-              <span class="row-label">Devil Fruit Stored</span>
+              <span class="row-label">Devil Fruit Caught / Stored</span>
               <div class="toggle" id="logDevilFruitToggle"
                 onclick="toggleLoggingExpandable('logDevilFruitToggle','logDevilFruitExpand')"></div>
             </div>
@@ -962,21 +737,6 @@
               <div class="row-item sub"><span class="row-label">Ping on event</span>
                 <div class="row-ctrl">
                   <div class="toggle" id="pingDevilFruitToggle" onclick="toggleSetting('pingDevilFruit')"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="notif-row">
-            <div class="notif-main">
-              <span class="row-label">Devil Fruit Spawns</span>
-              <div class="toggle" id="logSpawnsToggle"
-                onclick="toggleLoggingExpandable('logSpawnsToggle','logSpawnsExpand')"></div>
-            </div>
-            <div class="expandable" id="logSpawnsExpand">
-              <div class="row-item sub"><span class="row-label">Ping on event</span>
-                <div class="row-ctrl">
-                  <div class="toggle" id="pingSpawnsToggle" onclick="toggleSetting('pingSpawns')"></div>
                 </div>
               </div>
             </div>
@@ -1059,82 +819,6 @@
         </div>
       </div>
 
-      <div class="view" id="devices">
-        <div class="page-header">
-          <h1>Devices</h1>
-          <p>RDP detection and multi-device sync</p>
-        </div>
-
-        <div class="section-title">Session</div>
-        <div class="panel">
-          <div class="row-item">
-            <span class="row-label">Current Session Type</span>
-            <div class="row-ctrl">
-              <span class="status-inline" id="sessionTypeIndicator"><span class="dot"></span><span
-                  id="sessionTypeText">Detecting…</span></span>
-            </div>
-          </div>
-          <div class="row-item">
-            <span class="row-label">Auto-Detect RDP</span>
-            <div class="row-ctrl">
-              <div class="toggle active" id="autoDetectRdpToggle" onclick="toggleSetting('autoDetectRdp')"></div>
-            </div>
-          </div>
-        </div>
-
-        <div class="section-title">Sync</div>
-        <div class="panel">
-          <div class="row-item">
-            <span class="row-label">Enable Device Synchronization</span>
-            <div class="row-ctrl">
-              <div class="toggle" id="enableDeviceSyncToggle"
-                onclick="toggleExpandable('enableDeviceSync','deviceSyncExpand')"></div>
-            </div>
-          </div>
-          <div class="expandable" id="deviceSyncExpand">
-            <div class="row-item"><span class="row-label">Sync Settings</span>
-              <div class="row-ctrl">
-                <div class="toggle active" id="syncSettingsToggle" onclick="toggleSetting('syncSettings')"></div>
-              </div>
-            </div>
-            <div class="row-item"><span class="row-label">Sync Statistics</span>
-              <div class="row-ctrl">
-                <div class="toggle active" id="syncStatsToggle" onclick="toggleSetting('syncStats')"></div>
-              </div>
-            </div>
-            <div class="row-item"><span class="row-label">Share Fish Count</span>
-              <div class="row-ctrl">
-                <div class="toggle" id="shareFishCountToggle" onclick="toggleSetting('shareFishCount')"></div>
-              </div>
-            </div>
-            <div class="row-item"><span class="row-label">Sync Interval</span>
-              <div class="row-ctrl"><input type="number" class="inp" id="syncInterval" value="5" step="1" min="1"
-                  max="60" onchange="sendToPython('set_sync_interval',this.value)"><span class="unit">sec</span></div>
-            </div>
-          </div>
-        </div>
-
-        <div class="section-title">Client Identity</div>
-        <div class="panel">
-          <div class="row-item"><span class="row-label">Device Name</span>
-            <div class="row-ctrl"><input type="text" class="inp inp-med" id="deviceName" placeholder="My Gaming PC"
-                onchange="sendToPython('set_device_name',this.value)"></div>
-          </div>
-          <div class="row-item">
-            <span class="row-label">Client ID</span>
-            <div class="row-ctrl">
-              <span class="mono-badge" id="clientIdDisplay">Loading…</span>
-              <button class="btn-sm" onclick="regenerateClientId()">Regenerate</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="section-title">Active Sessions</div>
-        <div id="activeSessionsContainer">
-          <div class="empty-msg">Loading sessions…</div>
-        </div>
-      </div>
-
       <div class="view" id="settings">
         <div class="page-header">
           <h1>Settings</h1>
@@ -1206,8 +890,8 @@
           <div class="row-item"><span class="row-label">View Config JSON</span>
             <div class="row-ctrl"><button class="btn-sm" onclick="sendToPython('view_config','')">View</button></div>
           </div>
-          <div class="row-item"><span class="row-label">Clear Cache</span>
-            <div class="row-ctrl"><button class="btn-sm" onclick="sendToPython('clear_cache','')">Clear</button></div>
+          <div class="row-item"><span class="row-label">Reset Session Stats</span>
+            <div class="row-ctrl"><button class="btn-sm" onclick="resetStats()">Reset</button></div>
           </div>
         </div>
       </div>

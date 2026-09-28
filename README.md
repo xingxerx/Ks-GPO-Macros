@@ -6,14 +6,15 @@
 
 ## Features
 
-- **PD Controller** for smooth fishing minigame tracking
-- **Auto-craft bait** - configurable purchase intervals
-- **Auto-buy bait** - configurable craft intervals
-- **Auto-store devil fruits** - ability to store to ` backpack instead
-- **Anti-macro detection** - clears black screens automatically
-- **Hybrid-based UI** - no tkinter nonsense
-- **Real-time stats** - fish count, time, fish/hour
-- **Customizable everything** - hotkeys, timings, automation settings
+- **Vision-based minigame control** - follows the fish line with a PD controller
+- **Smart bait selection** - uses the best bait in stock (default Rare, then Legendary, then Common)
+- **Auto-buy bait** - on a loop interval, and right away when every bait tier has run out
+- **Devil fruit tracking** - counts drops from GPO's drop notice, split by rarity, with a session history
+- **Auto-store devil fruits** - to storage or the backpack; duplicates are kept unless you opt in to dropping them
+- **Anti-macro detection** - handles black screens automatically
+- **Megalodon sound detection** - optional
+- **Real-time stats** - dashboard and an optional overlay: fish, fruits, time, fish/hour
+- **Discord webhook** notifications
 
 ## Installation
 ```bash
@@ -29,7 +30,10 @@ pip install -r requirements.txt
    npm run tauri dev -- --no-watch
 ```
 
-That's it. The bot handles the rest.
+In dev builds the app runs `src-tauri/backend.py` directly, so after editing it just restart the app.
+`--no-watch` stops Tauri from restarting the app whenever the backend writes its settings or logs.
+
+Start and stop fishing with `F1` or the Start button in the sidebar.
 
 ## Hotkeys
 

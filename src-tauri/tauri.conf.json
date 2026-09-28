@@ -41,13 +41,6 @@
         "label": "fish"
       },
       {
-        "title": "K's Juzo Macro",
-        "resizable": true,
-        "visible": false,
-        "url": "juzo.html",
-        "label": "juzo"
-      },
-      {
         "title": "Stats",
         "width": 300,
         "height": 200,
@@ -83,7 +76,6 @@
     "resources": [
       "Python314",
       "backend.pyc",
-      "pictures/*",
       "sounds/*"
     ],
     "windows": {

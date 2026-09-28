@@ -5,8 +5,6 @@
   "windows": [
     "fish",
     "hub",
-    "juzo",
-    "bootstrapper",
     "stats",
     "launcher"
   ],

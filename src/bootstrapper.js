@@ -224,22 +224,6 @@ async function boot() {
 
     await checkForUpdates();
 
-    if (window.__TAURI__) {
-        try {
-            const { check } = await import('@tauri-apps/plugin-updater');
-            const update = await check();
-            if (update) {
-                const yes = confirm(`Update ${update.version} available. Install now?`);
-                if (yes) {
-                    setStatus('Downloading update…');
-                    appendLog(`Downloading update ${update.version}…`, 'info');
-                    await update.downloadAndInstall();
-                    return;
-                }
-            }
-        } catch (_) { }
-    }
-
     await killConflictingProcesses();
 
     setSysinfo({ status: 'Ready', statusSub: 'all checks passed' });

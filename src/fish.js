@@ -1,14 +1,12 @@
 let CURRENT_VERSION = '0.0.0';
 const GITHUB_REPO = 'K3nD4rk-Code-Developer/Grand-Piece-Online-Fishing';
-const CLIENT_ID = getClientId();
 
 let BackendPort = 0;
-let pollInterval = null;
+let pollTimer = null;
+let pollingStarted = false;
+let lastFullSync = 0;
 let activeCategoryIndex = 0;
 let activeSlideIndex = 0;
-let lastRenderedRecipes = null;
-let lastRenderedSessionsJSON = null;
-let lastSessionsUpdateTime = 0;
 let activeElement = null;
 let skipNextUpdate = new Set();
 
@@ -18,15 +16,6 @@ const invoke = window.__TAURI__?.core?.invoke ?? (async (cmd, args) => {
     if (cmd === 'get_backend_port') return window.__BACKEND_PORT__ || 0;
     return null;
 });
-
-function getClientId() {
-    let id = localStorage.getItem('macroClientId');
-    if (!id) {
-        id = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-        localStorage.setItem('macroClientId', id);
-    }
-    return id;
-}
 
 function extractVersion(v) {
     const m = v.match(/(\d+)\.(\d+)\.(\d+)/);
@@ -53,7 +42,7 @@ function flog(msg) {
 }
 
 function BackendUrl(path) {
-    return `http://localhost:${BackendPort}${path}`;
+    return `http://127.0.0.1:${BackendPort}${path}`;
 }
 
 function ApplyBackendPort(port) {
@@ -61,11 +50,7 @@ function ApplyBackendPort(port) {
     if (BackendPort === port) return;
     BackendPort = port;
     flog(`BackendPort updated to ${BackendPort}`);
-    if (pollInterval) {
-        clearInterval(pollInterval);
-        pollInterval = setInterval(pollPythonState, 500);
-        flog('Polling restarted on new port');
-    }
+    lastFullSync = 0;
 }
 
 if (window.__TAURI__?.event?.listen) {
@@ -102,10 +87,12 @@ async function sendToPython(action, payload) {
         const res = await fetch(BackendUrl('/command'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action, payload, clientId: CLIENT_ID })
+            body: JSON.stringify({ action, payload })
         });
         const result = await res.json();
         if (result.status === 'error') showErrorNotification(`Error: ${result.message}`);
+        // Pull settings on the next tick so the change (and anything it affected) shows right away
+        lastFullSync = 0;
         return result;
     } catch (e) {
         console.error('Failed to send to Python:', e);
@@ -147,6 +134,68 @@ function setExpandableSection(toggleId, expandId, isActive) {
 function updateStatus(isRunning) {
     document.getElementById('statusDot').classList.toggle('active', isRunning);
     document.getElementById('statusText').textContent = isRunning ? 'Active' : 'Inactive';
+    const btn = document.getElementById('macroToggleBtn');
+    if (btn) {
+        btn.textContent = isRunning ? 'Stop' : 'Start';
+        btn.classList.toggle('running', isRunning);
+    }
+}
+
+async function toggleMacro() {
+    await sendToPython('toggle_macro', '');
+}
+
+async function resetStats() {
+    if (!confirm('Reset fish, devil fruit and time counters for this session?')) return;
+    await sendToPython('reset_stats', '');
+    lastRenderedFruitKey = null;
+}
+
+const RARITY_LABELS = { Common: 'Common', Rare: 'Rare', Epic: 'Epic', Legendary: 'Legendary', Mythical: 'Mythical', Unknown: 'Other' };
+let lastRenderedFruitKey = null;
+
+function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Session numbers on the Dashboard: counts, the per-rarity split and the latest fruit drops
+function updateDashboard(state) {
+    const set = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+    set('dashFish', state.fishCaught || 0);
+    set('dashFruits', state.devilFruitsCaught || 0);
+    set('dashRate', (state.fishPerHour || 0).toFixed(1));
+    set('dashTime', state.timeElapsed || '0:00:00');
+
+    const history = state.fruitHistory || [];
+    const key = JSON.stringify([state.devilFruitsByRarity, history]);
+    if (key === lastRenderedFruitKey) return;
+    lastRenderedFruitKey = key;
+
+    const rarityEl = document.getElementById('dashRarity');
+    if (rarityEl) {
+        const counts = state.devilFruitsByRarity || {};
+        rarityEl.innerHTML = Object.keys(RARITY_LABELS)
+            .filter(r => counts[r] || ['Common', 'Rare', 'Epic', 'Legendary', 'Mythical'].includes(r))
+            .map(r => `<span class="rarity-chip rarity-${r}">${RARITY_LABELS[r]}<b>${counts[r] || 0}</b></span>`)
+            .join('');
+    }
+
+    const historyEl = document.getElementById('dashFruitHistory');
+    if (historyEl) {
+        if (!history.length) {
+            historyEl.innerHTML = '<div class="empty-msg">No devil fruits yet this session</div>';
+            return;
+        }
+        historyEl.innerHTML = history.slice().reverse().map(f => {
+            const name = f.name === 'Unknown' ? 'Devil fruit' : escapeHtml(f.name);
+            const pity = f.pity != null ? ` · pity ${f.pity}/40` : '';
+            return `<div class="fruit-row">
+              <span class="fruit-time">${escapeHtml(f.time)}</span>
+              <span class="rarity-${escapeHtml(f.rarity)}">${name} <span class="fruit-meta">(${RARITY_LABELS[f.rarity] || escapeHtml(f.rarity)})</span></span>
+              <span class="fruit-meta">catch #${f.catch}${pity}</span>
+            </div>`;
+        }).join('');
+    }
 }
 
 // Live view of the macro loop, so the window shows the step it is on rather than just on/off
@@ -177,15 +226,6 @@ function updateFruitDetectStatus(state) {
 function updateHotkey(key, value) {
     const el = document.getElementById(`hotkey-${key}`);
     if (el) el.textContent = value.toUpperCase();
-}
-
-function updateRdpIndicator(isRdp, sessionState) {
-    const pill = document.getElementById('rdpIndicator');
-    const text = document.getElementById('rdpText');
-    const stEl = document.getElementById('sessionTypeText');
-    pill.classList.toggle('active', isRdp);
-    text.textContent = isRdp ? (sessionState === 'connected' ? 'RDP' : 'RDP?') : 'Local';
-    if (stEl) stEl.textContent = isRdp ? 'Remote Desktop' : 'Local Desktop';
 }
 
 function updatePointStatus(name, x, y) {
@@ -221,20 +261,10 @@ function checkRequirements(name) {
             if (document.getElementById(id)?.classList.contains('unset')) missing = true;
         });
     }
-    if (name === 'autoCraftBait') {
-        ['craftLeftPointStatus', 'craftMiddlePointStatus', 'craftButtonPointStatus', 'craftConfirmPointStatus', 'closeMenuPointStatus', 'addRecipePointStatus', 'topRecipePointStatus'].forEach(id => {
-            if (document.getElementById(id)?.classList.contains('unset')) missing = true;
-        });
-    }
     if (name === 'autoSelectBait') {
         // Smart mode finds bait by OCR, so the Top Bait Point is only an optional fallback
         const smart = document.getElementById('smartBaitSelectToggle')?.classList.contains('active');
         if (!smart && document.getElementById('baitPointStatus')?.classList.contains('unset')) missing = true;
-    }
-    if (name === 'autoSellFish') {
-        ['sellLeftPointStatus', 'sellMiddlePointStatus', 'sellAcceptPointStatus', 'sellClosePointStatus'].forEach(id => {
-            if (document.getElementById(id)?.classList.contains('unset')) missing = true;
-        });
     }
     warn.classList.toggle('hidden', !(on && missing));
 }
@@ -259,8 +289,6 @@ async function toggleFastMode(enabled) {
             body: JSON.stringify({ enabled })
         });
     } catch (e) { }
-    if (pollInterval) clearInterval(pollInterval);
-    pollInterval = setInterval(pollPythonState, enabled ? 1000 : 500);
 }
 
 function loadFastMode() {
@@ -346,26 +374,13 @@ async function downloadUpdate() {
         await fetch(BackendUrl('/command'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'open_browser', payload: url, clientId: CLIENT_ID })
+            body: JSON.stringify({ action: 'open_browser', payload: url })
         });
     } catch (e) { window.location.href = url; }
 }
 
 function dismissBanner() {
     document.getElementById('updateBanner').classList.add('hidden');
-}
-
-async function regenerateClientId() {
-    if (!confirm('This will generate a new Client ID and may disconnect this device from sync. Continue?')) return;
-    localStorage.removeItem('macroClientId');
-    const newId = getClientId();
-    document.getElementById('clientIdDisplay').textContent = newId;
-    try {
-        await sendToPython('set_client_id', newId);
-        showToast('Client ID regenerated. Please restart the macro.', 'warn');
-    } catch (e) {
-        showToast('Failed to regenerate Client ID', 'err');
-    }
 }
 
 async function loadAndBuildSlideshow() {
@@ -551,8 +566,7 @@ function toggleLoggingExpandable(toggleId, expandId) {
         'logPeriodicStatsToggle': 'log_periodic_stats',
         'logGeneralUpdatesToggle': 'log_general_updates',
         'logMacroStateToggle': 'log_macro_state',
-        'logErrorsToggle': 'log_errors',
-        'logSpawnsToggle': 'log_spawns'
+        'logErrorsToggle': 'log_errors'
     };
     const name = nameMap[toggleId];
     if (name) sendToPython(`toggle_${name}`, isActive.toString());
@@ -622,8 +636,7 @@ async function selectAudioDevice(value) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 action: 'set_audio_device',
-                payload: JSON.stringify({ index: value !== 'auto' ? parseInt(value) : null, name: opt.dataset.deviceName || '' }),
-                clientId: CLIENT_ID
+                payload: JSON.stringify({ index: value !== 'auto' ? parseInt(value) : null, name: opt.dataset.deviceName || '' })
             })
         });
     } catch (e) { showErrorNotification('Failed to set audio device'); }
@@ -636,7 +649,7 @@ async function testWebhook() {
         const res = await fetch(BackendUrl('/command'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'test_webhook', payload: '', clientId: CLIENT_ID })
+            body: JSON.stringify({ action: 'test_webhook', payload: '' })
         });
         const result = await res.json();
         if (result.status !== 'success') showErrorNotification(`Webhook test failed: ${result.message}`);
@@ -669,75 +682,6 @@ async function testBaitScan() {
     showToast(`Found (best first): ${found}`, 'warn');
 }
 
-function renderRecipes(recipes) {
-    const container = document.getElementById('RecipesContainer');
-    if (!container) return;
-    if (JSON.stringify(recipes) === JSON.stringify(lastRenderedRecipes)) return;
-    lastRenderedRecipes = JSON.parse(JSON.stringify(recipes));
-    container.innerHTML = '';
-    if (!recipes.length) {
-        container.innerHTML = '<div class="empty-msg">No recipes configured. Click "+ Add Recipe" to get started.</div>';
-        return;
-    }
-    recipes.forEach((r, i) => {
-        const div = document.createElement('div');
-        div.className = 'recipe-card';
-        div.innerHTML = `
-          <div class="recipe-header-row">
-            <span class="recipe-title">Recipe ${i + 1}</span>
-            <button class="btn-sm" onclick="removeRecipe(${i})">Remove</button>
-          </div>
-          <div class="row-item">
-            <span class="row-label">Bait Recipe Selection</span>
-            <div class="row-ctrl">
-              <span class="point-badge ${r.BaitRecipePoint ? 'set' : 'unset'}">${r.BaitRecipePoint ? `${r.BaitRecipePoint.x}, ${r.BaitRecipePoint.y}` : 'Not Set'}</span>
-              <button class="btn-sm" onclick="setRecipePoint(${i},'BaitRecipePoint')">Set</button>
-            </div>
-          </div>
-          <div class="row-item">
-            <span class="row-label">Select Max Button</span>
-            <div class="row-ctrl">
-              <span class="point-badge ${r.SelectMaxPoint ? 'set' : 'unset'}">${r.SelectMaxPoint ? `${r.SelectMaxPoint.x}, ${r.SelectMaxPoint.y}` : 'Not Set'}</span>
-              <button class="btn-sm" onclick="setRecipePoint(${i},'SelectMaxPoint')">Set</button>
-            </div>
-          </div>
-          <div class="row-item">
-            <span class="row-label">Switch Fish Cycle</span>
-            <div class="row-ctrl">
-              <input type="number" class="inp" value="${r.SwitchFishCycle || 5}" step="1" onchange="updateRecipeValue(${i},'SwitchFishCycle',this.value)">
-            </div>
-          </div>`;
-        container.appendChild(div);
-    });
-}
-
-async function addNewRecipe() {
-    try {
-        const res = await fetch(BackendUrl('/add_recipe'), { method: 'POST', headers: { 'Content-Type': 'application/json' } });
-        const result = await res.json();
-        if (result.status === 'success') { lastRenderedRecipes = null; await pollPythonState(); }
-    } catch (e) { console.error('Failed to add recipe:', e); }
-}
-
-async function removeRecipe(idx) {
-    try {
-        await fetch(BackendUrl('/remove_recipe'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index: idx }) });
-        await pollPythonState();
-    } catch (e) { console.error('Failed to remove recipe:', e); }
-}
-
-async function setRecipePoint(idx, type) {
-    try {
-        await fetch(BackendUrl('/set_recipe_point'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ recipeIndex: idx, pointType: type }) });
-    } catch (e) { console.error('Failed to set recipe point:', e); }
-}
-
-async function updateRecipeValue(idx, field, value) {
-    try {
-        await fetch(BackendUrl('/update_recipe_value'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ recipeIndex: idx, fieldName: field, value: parseInt(value) }) });
-    } catch (e) { console.error('Failed to update recipe value:', e); }
-}
-
 function confirmResetSettings() {
     if (confirm('This will reset ALL settings to defaults. This cannot be undone. Continue?')) {
         if (confirm('Really reset everything?')) {
@@ -746,8 +690,6 @@ function confirmResetSettings() {
                     const res = await fetch(BackendUrl('/state'));
                     const state = await res.json();
                     loadAllSettings(state);
-                    lastRenderedRecipes = null;
-                    renderRecipes(state.baitRecipes || []);
                     window.currentDevilFruitSlots = state.devilFruitHotkeys || ['3'];
                     renderDevilFruitSlotSelector(window.currentDevilFruitSlots);
                     window.lastValidRodSlot = state.rodHotkey || '1';
@@ -779,28 +721,18 @@ function loadAllSettings(state) {
     setToggleState('debugOverlayToggle', state.showDebugOverlay);
     setToggleState('megalodonSoundToggle', state.megalodonSoundEnabled);
     
-    setExpandableSection('enableSpawnDetectionToggle', 'spawnDetectionExpand', state.enableSpawnDetection || false);
     setExpandableSection('autoBuyBaitToggle', 'autoBuyExpand', state.autoBuyCommonBait);
-    setExpandableSection('autoCraftBaitToggle', 'autoCraftExpand', state.autoCraftBait);
     setExpandableSection('autoStoreFruitToggle', 'autoStoreExpand', state.autoStoreDevilFruit);
-    setExpandableSection('autoUsePotionBrewToggle', 'autoPotionBrewExpand', state.autoUsePotionBrew || false);
     setExpandableSection('autoSelectBaitToggle', 'autoSelectBaitExpand', state.autoSelectTopBait);
     updateSmartBait(state);
     setToggleState('storeToBackpackToggle', state.storeToBackpack);
     setToggleState('storeOnlyWhenDetectedToggle', state.storeOnlyWhenDetected !== false);
+    setToggleState('dropUnstorableFruitToggle', state.dropUnstorableFruit || false);
     setInputValue('fruitSweepLoops', state.fruitSweepLoops != null ? state.fruitSweepLoops : 25);
     updateFruitDetectStatus(state);
 
-    setExpandableSection('autoSellFishToggle', 'autoSellExpand', state.autoSellFish || false);
-    setInputValue('sellRepeatCount', state.sellRepeatCount != null ? state.sellRepeatCount : 3);
-    setInputValue('loopsPerSell', state.loopsPerSell != null ? state.loopsPerSell : 50);
     setInputValue('loopsPerTopBait', state.loopsPerTopBait != null ? state.loopsPerTopBait : 1);
-    updatePointStatus('sellLeftPoint', state.sellLeftPoint?.x, state.sellLeftPoint?.y);
-    updatePointStatus('sellMiddlePoint', state.sellMiddlePoint?.x, state.sellMiddlePoint?.y);
-    updatePointStatus('sellSelectTopPoint', state.sellSelectTopPoint?.x, state.sellSelectTopPoint?.y);
-    updatePointStatus('sellAcceptPoint', state.sellAcceptPoint?.x, state.sellAcceptPoint?.y);
-    updatePointStatus('sellClosePoint', state.sellClosePoint?.x, state.sellClosePoint?.y);
-    
+
     setInputValue('kp', state.kp);
     setInputValue('kd', state.kd);
     setInputValue('pdClamp', state.pdClamp);
@@ -814,8 +746,6 @@ function loadAllSettings(state) {
     setInputValue('stateResend', state.stateResendInterval);
     setInputValue('loopsPerPurchase', state.loopsPerPurchase);
     setInputValue('loopsPerStore', state.loopsPerStore);
-    setInputValue('moveDuration', state.moveDuration);
-    setInputValue('fishCountPerCraft', state.fishCountPerCraft);
     setInputValue('focusDelay', state.robloxFocusDelay);
     setInputValue('postFocusDelay', state.robloxPostFocusDelay);
     setInputValue('preCastE', state.preCastEDelay);
@@ -832,27 +762,17 @@ function loadAllSettings(state) {
     setInputValue('scanDelay', state.scanLoopDelay);
     setInputValue('blackThreshold', state.blackScreenThreshold);
     setInputValue('spamDelay', state.antiMacroSpamDelay);
-    setInputValue('craftMenuDelay', state.craftMenuOpenDelay);
-    setInputValue('craftClickDelay', state.craftClickDelay);
-    setInputValue('craftRecipeDelay', state.craftRecipeSelectDelay);
-    setInputValue('craftAddDelay', state.craftAddRecipeDelay);
-    setInputValue('craftTopDelay', state.craftTopRecipeDelay);
-    setInputValue('craftButtonDelay', state.craftButtonClickDelay);
-    setInputValue('craftCloseDelay', state.craftCloseMenuDelay);
     setInputValue('webhookUrl', state.webhookUrl || '');
     setInputValue('discordUserId', state.discordUserId || '');
     setInputValue('soundSensitivity', state.soundSensitivity || 0.1);
-    setInputValue('spawnScanInterval', state.spawnScanInterval || 5.0);
-
-    setInputValue('potionBrewInterval', state.potionBrewIntervalMinutes != null ? state.potionBrewIntervalMinutes : 30);
-    setInputValue('potionBrewSlot', state.potionBrewSlot || '4');
-    setInputValue('brewEquipDelay', state.brewEquipDelay != null ? state.brewEquipDelay : 0.3);
-    setInputValue('brewUseDelay', state.brewUseDelay != null ? state.brewUseDelay : 4.5);
+    const audioSel = document.getElementById('audioDeviceSelect');
+    if (audioSel && document.activeElement !== audioSel) {
+        const wanted = state.audioDeviceIndex != null ? String(state.audioDeviceIndex) : 'auto';
+        if ([...audioSel.options].some(o => o.value === wanted)) audioSel.value = wanted;
+    }
 
     setExpandableSection('logDevilFruitToggle', 'logDevilFruitExpand', state.logDevilFruit || false);
     setToggleState('pingDevilFruitToggle', state.pingDevilFruit || false);
-    setExpandableSection('logSpawnsToggle', 'logSpawnsExpand', state.logSpawns || false);
-    setToggleState('pingSpawnsToggle', state.pingSpawns || false);
     setExpandableSection('logRecastTimeoutsToggle', 'logRecastTimeoutsExpand', state.logRecastTimeouts || false);
     setToggleState('pingRecastTimeoutsToggle', state.pingRecastTimeouts || false);
     setExpandableSection('logPeriodicStatsToggle', 'logPeriodicStatsExpand', state.logPeriodicStats || false);
@@ -871,15 +791,6 @@ function loadAllSettings(state) {
     updatePointStatus('rightPoint', state.rightPoint?.x, state.rightPoint?.y);
     updatePointStatus('storeFruitPoint', state.storeFruitPoint?.x, state.storeFruitPoint?.y);
     updatePointStatus('baitPoint', state.baitPoint?.x, state.baitPoint?.y);
-    updatePointStatus('craftLeftPoint', state.craftLeftPoint?.x, state.craftLeftPoint?.y);
-    updatePointStatus('craftMiddlePoint', state.craftMiddlePoint?.x, state.craftMiddlePoint?.y);
-    updatePointStatus('addRecipePoint', state.addRecipePoint?.x, state.addRecipePoint?.y);
-    updatePointStatus('topRecipePoint', state.topRecipePoint?.x, state.topRecipePoint?.y);
-    updatePointStatus('craftButtonPoint', state.craftButtonPoint?.x, state.craftButtonPoint?.y);
-    updatePointStatus('craftConfirmPoint', state.craftConfirmPoint?.x, state.craftConfirmPoint?.y);
-    updatePointStatus('closeMenuPoint', state.closeMenuPoint?.x, state.closeMenuPoint?.y);
-
-    if (state.baitRecipes !== undefined) renderRecipes(state.baitRecipes);
     window.currentBackpackLocations = state.backpackLocations || [];
     if (state.devilFruitHotkeys && state.backpackLocations !== undefined) {
         renderBackpackLocationRows(state.devilFruitHotkeys, state.backpackLocations);
@@ -905,79 +816,59 @@ async function loadInitialSettings() {
     console.error('Failed to load settings after max attempts — backend may be down.');
 }
 
+function applyLiveState(state) {
+    updateStatus(state.isRunning);
+    updateMacroActivity(state);
+    updateSmartBait(state);
+    updateFruitDetectStatus(state);
+    updateDashboard(state);
+}
+
+function applyFullState(state) {
+    applyLiveState(state);
+    // Toggles and values changed by hotkeys, reset/import or the macro itself show up here.
+    // Focused inputs and just-clicked toggles are left alone
+    loadAllSettings(state);
+
+    if (state.is_admin !== undefined) {
+        document.getElementById('adminIndicator').classList.toggle('active', state.is_admin);
+        document.getElementById('adminText').textContent = state.is_admin ? 'Running as Admin' : 'Not Admin';
+    }
+
+    const portEl = document.getElementById('backendPortDisplay');
+    if (portEl) portEl.textContent = `:${BackendPort}`;
+
+    checkRequirements('autoStoreFruit');
+    checkRequirements('autoBuyBait');
+    checkRequirements('autoSelectBait');
+}
+
+// The live state (status, counters) is small and polled twice a second; the full settings only every few
+// seconds or right after a change. Each request takes time from the macro's minigame loop, so keep them light
 async function pollPythonState() {
+    if (!BackendPort) return;
+    const full = Date.now() - lastFullSync > 3000;
     try {
-        const res = await fetch(BackendUrl(`/state?clientId=${CLIENT_ID}`));
+        const res = await fetch(BackendUrl(full ? '/state' : '/state?live=1'));
         const state = await res.json();
-
-        updateStatus(state.isRunning);
-        updateMacroActivity(state);
-
-        // Same sync as startup, every tick: toggles and values changed by hotkeys, reset/import,
-        // or the macro itself show up here. Focused inputs and just-clicked toggles are left alone
-        loadAllSettings(state);
-
-        if (state.is_admin !== undefined) {
-            document.getElementById('adminIndicator').classList.toggle('active', state.is_admin);
-            document.getElementById('adminText').textContent = state.is_admin ? 'Running as Admin' : 'Not Admin';
+        if (full) {
+            lastFullSync = Date.now();
+            applyFullState(state);
+        } else {
+            applyLiveState(state);
         }
-
-        const portEl = document.getElementById('backendPortDisplay');
-        if (portEl) portEl.textContent = `:${BackendPort}`;
-
-        if (state.activeSessions) renderActiveSessions(state.activeSessions);
-        if (state.rdp_detected !== undefined) updateRdpIndicator(state.rdp_detected, state.rdp_session_state);
-
-        const clientIdEl = document.getElementById('clientIdDisplay');
-        if (clientIdEl) clientIdEl.textContent = CLIENT_ID;
-
-        setToggleState('autoDetectRdpToggle', state.auto_detect_rdp !== false);
-        setExpandableSection('enableDeviceSyncToggle', 'deviceSyncExpand', state.enable_device_sync || false);
-        setToggleState('syncSettingsToggle', state.sync_settings !== false);
-        setToggleState('syncStatsToggle', state.sync_stats !== false);
-        setToggleState('shareFishCountToggle', state.share_fish_count || false);
-
-        if (state.sync_interval) setInputValue('syncInterval', state.sync_interval);
-        if (state.device_name) setInputValue('deviceName', state.device_name);
-
-        checkRequirements('autoStoreFruit');
-        checkRequirements('autoBuyBait');
-        checkRequirements('autoCraftBait');
-        checkRequirements('autoSelectBait');
-        checkRequirements('autoSellFish');
     } catch (e) { }
 }
 
-function renderActiveSessions(sessions) {
-    const container = document.getElementById('activeSessionsContainer');
-    if (!container) return;
-    const now = Date.now();
-    if (now - lastSessionsUpdateTime < 5000) return;
-    const json = JSON.stringify(sessions);
-    if (json === lastRenderedSessionsJSON) { lastSessionsUpdateTime = now; return; }
-    lastSessionsUpdateTime = now;
-    lastRenderedSessionsJSON = json;
-    const valid = sessions.filter(s => s.client_id && s.client_id !== 'unknown' && s.client_id.trim());
-    if (!valid.length) { container.innerHTML = '<div class="empty-msg">No active sessions detected</div>'; return; }
-    container.innerHTML = '';
-    valid.sort((a, b) => (a.client_id === CLIENT_ID ? -1 : b.client_id === CLIENT_ID ? 1 : 0));
-    valid.forEach(s => {
-        const isSelf = s.client_id === CLIENT_ID;
-        const card = document.createElement('div');
-        card.className = 'device-card' + (isSelf ? ' current-client' : '');
-        card.innerHTML = `
-          <div class="device-row">
-            <div class="device-name">${isSelf ? '★ This Device' : `Client ${s.client_id.substring(0, 12)}...`}</div>
-            ${s.rdp_detected ? `<span class="device-status">RDP ${s.rdp_state}</span>` : ''}
-          </div>
-          <div class="device-id">ID: ${s.client_id}</div>`;
-        container.appendChild(card);
-    });
-}
-
 function startPolling() {
-    if (pollInterval) clearInterval(pollInterval);
-    pollInterval = setInterval(pollPythonState, 500);
+    if (pollingStarted) return;
+    pollingStarted = true;
+    // A chained timeout never overlaps a slow request the way setInterval does; a hidden window polls slowly
+    const tick = async () => {
+        await pollPythonState();
+        pollTimer = setTimeout(tick, document.hidden ? 2000 : 500);
+    };
+    tick();
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
@@ -992,7 +883,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     checkForUpdates();
     checkDisclaimer();
     loadAndBuildSlideshow();
-    loadAudioDevices();
+    await loadAudioDevices();
     loadInitialSettings();
 
     setTimeout(() => {

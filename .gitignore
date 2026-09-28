@@ -25,11 +25,7 @@ dist-ssr
 /src-tauri/Python314
 /src-tauri/__pycache__
 /~
-src/juzo.html
-src/juzo.css
-src/juzo.js
 /src-tauri/model
-src-tauri/juzo.py
 /src-tauri/saved-hashes
 /src-tauri/hashes
 
@@ -45,7 +41,7 @@ logs/
 # Per-user settings: hold Discord webhook URLs, Discord user IDs and click coordinates for this PC.
 # The backend recreates them with defaults when missing, so they never need to be committed
 /src-tauri/Auto Fish Settings.json
-/src-tauri/Juzo Settings.json
+/src-tauri/Auto Fish Settings.json.tmp
 *.json.backup
 *.json.backup_*
 *.backup

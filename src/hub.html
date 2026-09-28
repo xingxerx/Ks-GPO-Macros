@@ -25,50 +25,6 @@
         <div class="ripple-ring" id="rippleRing"></div>
     </div>
 
-    <div class="modal-backdrop" id="modalBackdrop" onclick="closeKeyModal()"></div>
-
-    <div class="key-modal" id="keyModal">
-        <div class="modal-strip" id="modalStrip"></div>
-        <div class="modal-header">
-            <div class="modal-icon" id="modalIcon"></div>
-            <div class="modal-titles">
-                <div class="modal-title" id="modalTitle">Enter Key</div>
-                <div class="modal-sub" id="modalSub">KeyAuth verification required</div>
-            </div>
-            <button class="modal-close" onclick="closeKeyModal()">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-                    stroke-linecap="round" stroke-linejoin="round">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                </svg>
-            </button>
-        </div>
-        <div class="key-input-wrap" id="keyInputWrap">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                stroke-linecap="round" stroke-linejoin="round">
-                <path
-                    d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
-            </svg>
-            <input type="text" class="key-input" id="keyInput" placeholder="XXXX-XXXX-XXXX-XXXX" spellcheck="false"
-                autocomplete="off" onkeydown="handleKeyDown(event)">
-            <button class="key-clear" id="keyClear" style="display:none" onclick="clearKey()">
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-                    stroke-linecap="round" stroke-linejoin="round">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                </svg>
-            </button>
-        </div>
-        <div class="key-feedback" id="keyFeedback"></div>
-        <div class="modal-footer-btns">
-            <button class="btn-ghost" onclick="closeKeyModal()">Cancel</button>
-            <button class="btn-verify" id="btnVerify" onclick="verifyKey()">
-                <span id="verifyLabel">Verify & Launch</span>
-                <div class="btn-spinner" id="verifySpinner" style="display:none"></div>
-            </button>
-        </div>
-    </div>
-
     <div class="shell">
         <div class="header">
             <div class="brand-mark"></div>
