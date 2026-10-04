@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey.svg)
 
 ## Features
 
@@ -58,7 +58,27 @@ pynput
 pywin32
 ```
 
-Windows only because of the `win32gui` and `keyboard` libraries.
+Windows-only packages (`pywin32`, `keyboard`, `PyAudioWPatch`) and macOS-only ones (`pyobjc-*`) are marked in
+`requirements.txt`, so `pip install -r requirements.txt` picks the right set.
+
+## macOS
+
+Windows is unchanged; macOS runs the same macro with platform equivalents (Quartz for mouse input, pynput for keys
+and hotkeys, AppKit to focus Roblox).
+
+- **Permissions** - in System Settings > Privacy & Security, allow the app (or your terminal, in dev) under
+  **Accessibility**, **Input Monitoring** and **Screen Recording**, then restart it. The sidebar shows
+  "Accessibility Granted" once input control is allowed.
+- **Tkinter** - region selectors use Tk. python.org and python-build-standalone builds include it; with Homebrew,
+  `brew install python-tk`.
+- **Megalodon sound** - macOS can't record app audio directly. Install [BlackHole](https://github.com/ExistentialAudio/BlackHole),
+  create a Multi-Output Device (speakers + BlackHole) in Audio MIDI Setup and use it as the output. The macro finds
+  BlackHole automatically, or pick the input in the audio device list.
+- **Hotkeys** - `F1`/`F3` may need `fn` held, depending on your keyboard settings. You can rebind them.
+- **Release builds** - set `GPO_PYTHON_DIR` to a relocatable Python 3.14 with the requirements installed (e.g. a
+  [python-build-standalone](https://github.com/astral-sh/python-build-standalone) build), then `npm run tauri build`.
+  This produces a `.app` and `.dmg`. The app is unsigned, so open it the first time with right-click > Open.
+  Settings and logs live in `~/Library/Application Support/com.gpo.ksmacro`.
 
 ## License
 

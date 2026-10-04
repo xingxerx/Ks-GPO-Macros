@@ -17,25 +17,283 @@ from flask_cors import CORS
 import numpy as np
 import mss
 import pyautogui
-import keyboard
 from pynput import mouse
 from PIL import Image as PILImage
 import requests
 from difflib import get_close_matches, SequenceMatcher
 from scipy.fft import fft
-import pyaudiowpatch as pyaudio
 import argparse
 import socket
+import queue
+import contextvars
+import subprocess
 
 import ctypes
 
-import win32gui
-import win32con
-import win32api
 import cv2
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+IsMac = sys.platform == 'darwin'
+
+if IsMac:
+    import sounddevice
+    import Quartz
+    from AppKit import NSRunningApplication, NSApplicationActivateIgnoringOtherApps
+    from ApplicationServices import AXIsProcessTrusted
+    from pynput import keyboard as PynputKeyboard
+    from mss.screenshot import ScreenShot
+    from mss.models import Size
+else:
+    import keyboard
+    import pyaudiowpatch as pyaudio
+    import win32gui
+    import win32con
+    import win32api
+
+
+# ---- Platform layer: everything below the macro logic that differs between Windows and macOS ----
+
+if IsMac:
+    class MacKeyboard:
+        # Stands in for the `keyboard` package, which needs root on macOS; pynput only needs the Accessibility and
+        # Input Monitoring permissions. Covers just the calls this file makes, with the same key names
+        Aliases = {'control': 'ctrl', 'option': 'alt', 'command': 'cmd', 'windows': 'cmd', 'return': 'enter',
+                   'escape': 'esc', 'del': 'delete', 'spacebar': 'space'}
+
+        def __init__(self):
+            self.Controller = PynputKeyboard.Controller()
+            self.Hotkeys = {}
+            self.ReleaseHandlers = []
+            self.Pressed = set()
+            self.Listener = None
+            self.Lock = threading.Lock()
+
+        def Normalize(self, Name):
+            Name = Name.strip().lower()
+            return self.Aliases.get(Name, Name)
+
+        def ToKey(self, Name):
+            Name = self.Normalize(Name)
+            if len(Name) == 1:
+                return PynputKeyboard.KeyCode.from_char(Name)
+            Key = getattr(PynputKeyboard.Key, Name, None)
+            if Key is None:
+                raise ValueError(f"Unknown key: {Name}")
+            return Key
+
+        @staticmethod
+        def NameOf(Key):
+            # Left/right variants (shift_r, cmd_l) count as the plain key, like the `keyboard` package
+            if isinstance(Key, PynputKeyboard.Key):
+                return re.sub(r'_[lr]$', '', Key.name)
+            return Key.char.lower() if getattr(Key, 'char', None) else None
+
+        def EnsureListener(self):
+            if self.Listener is None:
+                self.Listener = PynputKeyboard.Listener(on_press=self.OnPress, on_release=self.OnRelease)
+                self.Listener.daemon = True
+                self.Listener.start()
+
+        def OnPress(self, Key):
+            Name = self.NameOf(Key)
+            if Name is None:
+                return
+            with self.Lock:
+                IsRepeat = Name in self.Pressed
+                self.Pressed.add(Name)
+                Matches = [] if IsRepeat else [Cb for Combo, Cb in self.Hotkeys.items() if Combo == self.Pressed]
+            # Callbacks can block (ToggleMacro waits for the old loop), and a blocked listener stalls all input
+            for Callback in Matches:
+                threading.Thread(target=Callback, daemon=True).start()
+
+        def OnRelease(self, Key):
+            Name = self.NameOf(Key)
+            if Name is None:
+                return
+            with self.Lock:
+                self.Pressed.discard(Name)
+                Handlers = list(self.ReleaseHandlers)
+            Event = type('KeyEvent', (), {'name': Name})()
+            for Handler in Handlers:
+                Handler(Event)
+
+        def add_hotkey(self, Combo, Callback):
+            Keys = frozenset(self.Normalize(Part) for Part in Combo.split('+'))
+            with self.Lock:
+                self.Hotkeys[Keys] = Callback
+            self.EnsureListener()
+
+        def on_release(self, Callback, suppress=False):
+            with self.Lock:
+                self.ReleaseHandlers.append(Callback)
+            self.EnsureListener()
+
+        def unhook_all_hotkeys(self):
+            with self.Lock:
+                self.Hotkeys.clear()
+
+        def unhook_all(self):
+            with self.Lock:
+                self.Hotkeys.clear()
+                self.ReleaseHandlers.clear()
+
+        def press(self, Name):
+            self.Controller.press(self.ToKey(Name))
+
+        def release(self, Name):
+            self.Controller.release(self.ToKey(Name))
+
+        def press_and_release(self, Name):
+            self.press(Name)
+            self.release(Name)
+
+        def write(self, Text):
+            self.Controller.type(Text)
+
+    keyboard = MacKeyboard()
+
+
+def SetCursorPos(X, Y):
+    if IsMac:
+        # A plain move while the button is held is ignored by games, so send a drag then (the fruit store drags)
+        Held = Quartz.CGEventSourceButtonState(Quartz.kCGEventSourceStateCombinedSessionState, Quartz.kCGMouseButtonLeft)
+        EventType = Quartz.kCGEventLeftMouseDragged if Held else Quartz.kCGEventMouseMoved
+        Event = Quartz.CGEventCreateMouseEvent(None, EventType, (X, Y), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, Event)
+    else:
+        ctypes.windll.user32.SetCursorPos(X, Y)
+
+
+def NudgeMouse(Dy):
+    # A relative move of a pixel or so, so the game sees real mouse movement and not just a teleported cursor
+    if IsMac:
+        Location = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+        SetCursorPos(Location.x, Location.y + Dy)
+    else:
+        ctypes.windll.user32.mouse_event(0x0001, 0, Dy, 0, 0)
+
+
+def GetScreenSize():
+    if IsMac:
+        # Points, the same space as mouse coordinates and (via NewScreenCapture) captured images
+        return pyautogui.size()
+    DisplayMetrics = ctypes.windll.user32
+    return DisplayMetrics.GetSystemMetrics(0), DisplayMetrics.GetSystemMetrics(1)
+
+
+def SetHighPriority(High):
+    if IsMac:
+        # Raising priority needs root on macOS, so leave the scheduler alone
+        return True
+    kernel32 = ctypes.windll.kernel32
+    Handle = kernel32.OpenProcess(0x0200, False, os.getpid())
+    if not Handle:
+        print("Failed to open process handle")
+        return False
+    # HIGH, not REALTIME: a realtime busy loop (the minigame) can starve Windows input handling as admin
+    Result = kernel32.SetPriorityClass(Handle, 0x00000080 if High else 0x00000020)
+    kernel32.CloseHandle(Handle)
+    if not Result:
+        print(f"Failed to set priority. Error: {ctypes.get_last_error()}")
+    return bool(Result)
+
+
+def HasInputPermission():
+    # Windows needs admin to send input to an elevated Roblox; macOS needs the Accessibility permission instead
+    try:
+        if IsMac:
+            return bool(AXIsProcessTrusted())
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def OpenInFileManager(Path):
+    if IsMac:
+        subprocess.Popen(['open', Path])
+    else:
+        os.startfile(Path)
+
+
+def GetDataDir():
+    # Settings, port files and debug output. On macOS the launcher points this at Application Support, since the
+    # .app bundle holding backend.pyc can be read-only
+    Override = os.environ.get('GPO_DATA_DIR')
+    if Override:
+        return Override
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+class RetinaSafeCapture:
+    # On Retina screens mss returns 2x the requested size, while regions and click points (pyautogui, pynput,
+    # tkinter) are in points, and every detector here assumes one pixel per point. Sampling back down with
+    # nearest-neighbour keeps colours exact, which the exact-match colour masks rely on
+    def __init__(self, Inner):
+        self.Inner = Inner
+
+    def __getattr__(self, Name):
+        return getattr(self.Inner, Name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *Args):
+        self.Inner.close()
+
+    def grab(self, Monitor):
+        Shot = self.Inner.grab(Monitor)
+        if isinstance(Monitor, tuple):
+            Monitor = {'left': Monitor[0], 'top': Monitor[1], 'width': Monitor[2] - Monitor[0], 'height': Monitor[3] - Monitor[1]}
+        Width, Height = Monitor['width'], Monitor['height']
+        if (Shot.width, Shot.height) == (Width, Height):
+            return Shot
+        Pixels = np.frombuffer(Shot.raw, dtype=np.uint8).reshape(Shot.height, Shot.width, 4)
+        Rows = np.arange(Height) * Shot.height // Height
+        Cols = np.arange(Width) * Shot.width // Width
+        Pixels = np.ascontiguousarray(Pixels[Rows][:, Cols])
+        return ScreenShot(bytearray(Pixels.tobytes()), Monitor, size=Size(Width, Height))
+
+
+def NewScreenCapture():
+    return RetinaSafeCapture(mss.mss()) if IsMac else mss.mss()
+
+
+MainThreadTasks = queue.Queue()
+
+
+def RunOnMainThread(Function):
+    # macOS only lets the main thread create windows, so tkinter calls from request/worker threads are queued for
+    # the main thread (see __main__) and waited on. The caller's context goes along so Flask's jsonify still works
+    if not IsMac or threading.current_thread() is threading.main_thread():
+        return Function()
+    Context = contextvars.copy_context()
+    Done = threading.Event()
+    Outcome = {}
+
+    def Task():
+        try:
+            Outcome['Result'] = Context.run(Function)
+        except BaseException as E:
+            Outcome['Error'] = E
+        finally:
+            Done.set()
+
+    MainThreadTasks.put(Task)
+    Done.wait()
+    if 'Error' in Outcome:
+        raise Outcome['Error']
+    return Outcome.get('Result')
+
+
+def OnMainThread(Function):
+    def Wrapper(*Args, **Kwargs):
+        return RunOnMainThread(lambda: Function(*Args, **Kwargs))
+    Wrapper.__name__ = Function.__name__
+    return Wrapper
 
 LogDir = os.path.join(os.getcwd(), 'logs')
 VisionDir = os.path.join(LogDir, 'vision')
@@ -106,9 +364,7 @@ class ConfigurationManager:
         self.Settings = self.InitializeDefaults()
     
     def InitializeDefaults(self):
-        DisplayMetrics = ctypes.windll.user32
-        MonitorWidth = DisplayMetrics.GetSystemMetrics(0)
-        MonitorHeight = DisplayMetrics.GetSystemMetrics(1)
+        MonitorWidth, MonitorHeight = GetScreenSize()
         
         return {
             'Hotkeys': {'StartStop': 'f1', 'Exit': 'f3'},
@@ -670,7 +926,7 @@ class DevilFruitDetector:
             "height": Region['Y2'] - Region['Y1']
         }
 
-        with mss.mss() as ScreenCapture:
+        with NewScreenCapture() as ScreenCapture:
             Image = np.array(ScreenCapture.grab(ScanRegion))
 
         ImageRGB = Image[:, :, [2, 1, 0]]
@@ -798,7 +1054,7 @@ class BaitListReader:
                 "height": Region['Y2'] - Region['Y1']
             }
 
-            with mss.mss() as ScreenCapture:
+            with NewScreenCapture() as ScreenCapture:
                 Image = np.array(ScreenCapture.grab(ScanRegion))
 
             # Bait names mix white and coloured text, so OCR the upscaled grayscale instead of a white threshold
@@ -990,7 +1246,7 @@ class ColorDetector:
     @staticmethod
     def DetectBlackScreen(ScanRegion, ImageArray=None, Threshold=0.5):
         if ImageArray is None:
-            with mss.mss() as ScreenCapture:
+            with NewScreenCapture() as ScreenCapture:
                 CaptureRegion = {
                     "top": ScanRegion["Y1"],
                     "left": ScanRegion["X1"],
@@ -1013,7 +1269,7 @@ class ColorDetector:
             return False
         
         try:
-            with mss.mss() as ScreenCapture:
+            with NewScreenCapture() as ScreenCapture:
                 CaptureRegion = {
                     "top": TargetPoint['y'] - Tolerance,
                     "left": TargetPoint['x'] - Tolerance,
@@ -1042,6 +1298,19 @@ class ColorDetector:
         except Exception as E:
             print(f"Error detecting green color: {E}")
             return False
+
+
+MacLoopbackNames = ('blackhole', 'loopback', 'soundflower', 'background music')
+
+
+def FindMacLoopbackDevice(SelectedIndex=None):
+    Devices = sounddevice.query_devices()
+    if SelectedIndex is not None and 0 <= SelectedIndex < len(Devices) and Devices[SelectedIndex]['max_input_channels'] > 0:
+        return SelectedIndex, Devices[SelectedIndex]
+    for Index, Device in enumerate(Devices):
+        if Device['max_input_channels'] > 0 and any(Name in Device['name'].lower() for Name in MacLoopbackNames):
+            return Index, Device
+    return None, None
 
 
 class MegalodonSoundDetector:
@@ -1101,9 +1370,71 @@ class MegalodonSoundDetector:
         Prob = 1 / (1 + np.exp(-Logit))
         return Prob
     
+    def ScoreAttempt(self, AudioData, AudioSampleRate, Attempt):
+        # One recording through the model; the same steps as the Windows loop in Listen
+        MaxAudio = np.max(np.abs(AudioData)) if len(AudioData) else 0
+        if MaxAudio < 0.01:
+            print(f"  Attempt {Attempt+1}: Too quiet (level: {MaxAudio:.4f})")
+            return False
+
+        AudioData = self.ReduceNoise(AudioData / MaxAudio)
+        SignalQuality = self.CalculateSignalQuality(AudioData)
+        WindowSamples = int(0.5 * AudioSampleRate)
+        HopSamples = int(0.1 * AudioSampleRate)
+
+        MaxProb = 0
+        for WindowStart in range(0, max(1, len(AudioData) - WindowSamples), HopSamples):
+            Chunk = AudioData[WindowStart:WindowStart + WindowSamples]
+            if len(Chunk) < WindowSamples:
+                continue
+            MaxProb = max(MaxProb, self.PredictProbability(self.ExtractFeatures(Chunk, AudioSampleRate)))
+
+        AdaptiveThreshold = self.Config.Settings['FishingModes']['SoundSensitivity'] * (0.7 + 0.3 * SignalQuality)
+        print(f"  Attempt {Attempt+1}: MaxProb={MaxProb:.4f}, Threshold={AdaptiveThreshold:.4f}, Quality={SignalQuality:.2f}")
+        return MaxProb > AdaptiveThreshold
+
+    def ListenMac(self):
+        # macOS has no output loopback like WASAPI's, so this records an input device carrying the game audio
+        # (BlackHole or similar, fed by a Multi-Output Device)
+        Index, Device = FindMacLoopbackDevice(self.Config.Settings['AudioDevice']['SelectedDeviceIndex'])
+        if Index is None:
+            print("No loopback input found - Megalodon sound detection disabled")
+            print("Install BlackHole and route system output through it with a Multi-Output Device")
+            return True
+
+        AudioSampleRate = int(Device.get('default_samplerate') or 44100)
+        if AudioSampleRate < 8000 or AudioSampleRate > 192000:
+            AudioSampleRate = 44100
+        Channels = min(2, Device['max_input_channels'])
+        MultipleAttempts = 2
+        PositiveDetections = 0
+
+        for Attempt in range(MultipleAttempts):
+            try:
+                Recording = sounddevice.rec(int(AudioSampleRate * 2.0), samplerate=AudioSampleRate, channels=Channels,
+                                            dtype='float32', device=Index)
+                sounddevice.wait()
+            except Exception as E:
+                print(f"Audio recording error: {E}")
+                return True
+            if self.ScoreAttempt(Recording.mean(axis=1), AudioSampleRate, Attempt):
+                PositiveDetections += 1
+
+        RequiredPositive = max(1, MultipleAttempts // 2)
+        print(f"Final result: {PositiveDetections}/{MultipleAttempts} positive detections (need {RequiredPositive})")
+        return PositiveDetections >= RequiredPositive
+
     def Listen(self, TimeoutDuration=5.0):
         if not self.Config.Settings['FishingModes']['MegalodonSound']:
             return True
+
+        if IsMac:
+            try:
+                return self.ListenMac()
+            except Exception as E:
+                print(f"Sound recognition error: {E}")
+                traceback.print_exc()
+                return True
         
         try:
             AudioInterface = pyaudio.PyAudio()
@@ -1322,6 +1653,9 @@ class InputController:
         self.Config = Config
     
     def FocusRobloxWindow(self):
+        if IsMac:
+            return self.FocusRobloxWindowMac()
+
         def FindRobloxWindow(Handle, Windows):
             if win32gui.IsWindowVisible(Handle):
                 Title = win32gui.GetWindowText(Handle)
@@ -1354,14 +1688,48 @@ class InputController:
 
         time.sleep(self.Config.Settings['TimingDelays']['RobloxWindow']['RobloxFocusDelay'])
         return win32gui.GetForegroundWindow() == Handle
+
+    @staticmethod
+    def FrontmostRobloxPids():
+        # The window list is ordered front to back and needs no permission for owner names. NSWorkspace's
+        # frontmostApplication would be simpler but goes stale in a process with no Cocoa run loop
+        Windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []
+        AppWindows = [W for W in Windows if W.get('kCGWindowLayer') == 0]
+        FrontPid = AppWindows[0].get('kCGWindowOwnerPID') if AppWindows else None
+        RobloxPids = [W.get('kCGWindowOwnerPID') for W in AppWindows if 'Roblox' in (W.get('kCGWindowOwnerName') or '')]
+        return FrontPid, RobloxPids
+
+    def FocusRobloxWindowMac(self):
+        FrontPid, RobloxPids = self.FrontmostRobloxPids()
+        if not RobloxPids:
+            return False
+        if FrontPid in RobloxPids:
+            return True
+
+        Pid = RobloxPids[0]
+        App = NSRunningApplication.runningApplicationWithProcessIdentifier_(Pid)
+        Delay = self.Config.Settings['TimingDelays']['RobloxWindow']['RobloxFocusDelay']
+        if App is not None:
+            App.unhide()
+            App.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+            time.sleep(Delay)
+            if self.FrontmostRobloxPids()[0] == Pid:
+                return True
+            # Newer macOS can refuse activation from a background process; LaunchServices still honours "open"
+            BundleUrl = App.bundleURL()
+            if BundleUrl is not None:
+                LogLine("FocusRobloxWindow: activate was refused, retrying through open")
+                subprocess.run(['open', BundleUrl.path()], timeout=5)
+                time.sleep(Delay)
+        return self.FrontmostRobloxPids()[0] == Pid
     
     def ClickPoint(self, Point):
         if not Point:
             return False
         
-        ctypes.windll.user32.SetCursorPos(Point['x'], Point['y'])
+        SetCursorPos(Point['x'], Point['y'])
         time.sleep(self.Config.Settings['TimingDelays']['PreCast']['PreCastAntiDetectDelay'])
-        ctypes.windll.user32.mouse_event(0x0001, 0, 1, 0, 0)
+        NudgeMouse(1)
         time.sleep(self.Config.Settings['TimingDelays']['PreCast']['PreCastAntiDetectDelay'])
         pyautogui.click()
         time.sleep(self.Config.Settings['TimingDelays']['PreCast']['PreCastClickDelay'])
@@ -1371,9 +1739,9 @@ class InputController:
         if not Point:
             return False
         
-        ctypes.windll.user32.SetCursorPos(Point['x'], Point['y'])
+        SetCursorPos(Point['x'], Point['y'])
         time.sleep(0.015)
-        ctypes.windll.user32.mouse_event(0x0001, 0, 1, 0, 0)
+        NudgeMouse(1)
         time.sleep(0.015)
         pyautogui.click()
         return True
@@ -1613,7 +1981,8 @@ class PointSelector:
                 if time.time() - StartTime < 0.25:
                     return True
                 
-                Callback(PointName, {"x": X, "y": Y})
+                # pynput reports macOS points as floats
+                Callback(PointName, {"x": int(X), "y": int(Y)})
                 self.CurrentlySettingPoint = None
                 return False
         
@@ -1729,7 +2098,7 @@ class FishingMinigameController:
         if Local is None:
             Local = self._CaptureLocal = threading.local()
         if getattr(Local, 'Sct', None) is None:
-            Local.Sct = mss.mss()
+            Local.Sct = NewScreenCapture()
         return Local.Sct
 
     @staticmethod
@@ -1921,40 +2290,21 @@ class AutomatedFishingSystem:
     def __init__(self):
         pyautogui.PAUSE = 0
 
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except:
+        if not IsMac:
             try:
-                ctypes.windll.user32.SetProcessDPIAware()
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
             except:
-                pass
+                try:
+                    ctypes.windll.user32.SetProcessDPIAware()
+                except:
+                    pass
 
         try:
-            kernel32 = ctypes.windll.kernel32
-            PROCESS_SET_INFORMATION = 0x0200
-            Pid = os.getpid()
-            Handle = kernel32.OpenProcess(PROCESS_SET_INFORMATION, False, Pid)
-            
-            if Handle:
-                # HIGH, not REALTIME: a realtime busy loop (the minigame) can starve Windows input handling as admin
-                Result = kernel32.SetPriorityClass(Handle, 0x00000080)
-                kernel32.CloseHandle(Handle)
-                
-                if not Result:
-                    ErrorCode = ctypes.get_last_error()
-                    print(f"Failed to set priority. Error: {ErrorCode}")
-            else:
-                print("Failed to open process handle")
-                
+            SetHighPriority(True)
         except Exception as E:
             print(f"Could not set process priority: {E}")
 
-        if getattr(sys, 'frozen', False):
-            AppPath = os.path.dirname(sys.executable)
-        else:
-            AppPath = os.path.dirname(os.path.abspath(__file__))
-
-        ConfigPath = os.path.join(AppPath, "Auto Fish Settings.json")
+        ConfigPath = os.path.join(GetDataDir(), "Auto Fish Settings.json")
         
         self.Config = ConfigurationManager(ConfigPath)
         self.Config.LoadFromDisk()
@@ -1969,7 +2319,7 @@ class AutomatedFishingSystem:
         self.InputController = InputController(self.Config)
         self.MinigameController = FishingMinigameController(self.Config, self.State)
         self.PointSelector = PointSelector()
-        self.IsAdmin = self.CheckAdminStatus()
+        self.IsAdmin = HasInputPermission()
         
         self.RegionSelectorActive = False
         self.ActiveRegionSelector = None
@@ -2047,7 +2397,7 @@ class AutomatedFishingSystem:
         
         def RunSelector():
             try:
-                self.ActiveRegionSelector = RegionSelectionWindow(None, self.Config.Settings['ScanArea'], self.HandleRegionComplete)
+                self.ActiveRegionSelector = RunOnMainThread(lambda: RegionSelectionWindow(None, self.Config.Settings['ScanArea'], self.HandleRegionComplete))
             finally:
                 self.RegionSelectorActive = False
                 self.ActiveRegionSelector = None
@@ -2063,12 +2413,6 @@ class AutomatedFishingSystem:
     def TerminateApp(self):
         os._exit(0)
     
-    def CheckAdminStatus(self):
-        try:
-            return ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except:
-            return False
-
     def CheckPeriodicStats(self):
         LogOpts = self.Config.Settings['LoggingOptions']
         if not self.Config.Settings['DevilFruitStorage']['WebhookUrl'] or not LogOpts['LogPeriodicStats'] or self.State.LastPeriodicStatsTime is None:
@@ -2112,9 +2456,9 @@ class AutomatedFishingSystem:
             return False
         
         self.State.UpdateStatus("Casting fishing line")
-        ctypes.windll.user32.SetCursorPos(Points['Water']['x'], Points['Water']['y'])
+        SetCursorPos(Points['Water']['x'], Points['Water']['y'])
         time.sleep(self.Config.Settings['TimingDelays']['AntiDetection']['CursorAntiDetectDelay'])
-        ctypes.windll.user32.mouse_event(0x0001, 0, 1, 0, 0)
+        NudgeMouse(1)
         
         if not self.State.IsRunning:
             return False
@@ -2526,10 +2870,10 @@ class AutomatedFishingSystem:
         # Save the full screen, the scanned region and the OCR text for a counted drop, so a count can be checked
         # against what was on screen and the Fruit Detection Area corrected if needed
         try:
-            DebugDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FruitScanDebug")
+            DebugDir = os.path.join(GetDataDir(), "FruitScanDebug")
             os.makedirs(DebugDir, exist_ok=True)
             Base = os.path.join(DebugDir, f"catch_{CatchNumber:05d}")
-            with mss.mss() as ScreenCapture:
+            with NewScreenCapture() as ScreenCapture:
                 Shot = ScreenCapture.grab(ScreenCapture.monitors[1])
             Full = PILImage.frombytes('RGB', Shot.size, Shot.rgb)
             Full.thumbnail((Full.width // 2, Full.height // 2))
@@ -2585,7 +2929,7 @@ class AutomatedFishingSystem:
                 if not self.State.IsRunning:
                     return
 
-                ctypes.windll.user32.SetCursorPos(TargetLocation['x'], TargetLocation['y'])
+                SetCursorPos(TargetLocation['x'], TargetLocation['y'])
                 time.sleep(0.1)
                 self.HumanizeMovement()
                 if not self.State.IsRunning:
@@ -2597,7 +2941,7 @@ class AutomatedFishingSystem:
                     pyautogui.mouseUp()
                     return
 
-                ctypes.windll.user32.SetCursorPos(TargetLocation['x'], TargetLocation['y'] - 150)
+                SetCursorPos(TargetLocation['x'], TargetLocation['y'] - 150)
                 self.HumanizeMovement()
                 pyautogui.mouseUp()
 
@@ -2844,13 +3188,13 @@ class AutomatedFishingSystem:
     
     def HumanizeMovement(self):
         for _ in range(5):
-            ctypes.windll.user32.mouse_event(0x0001, 0, 1, 0, 0)
+            NudgeMouse(1)
             time.sleep(0.05)
             if not self.State.IsRunning:
                 return
         
         for _ in range(5):
-            ctypes.windll.user32.mouse_event(0x0001, 0, -1, 0, 0)
+            NudgeMouse(-1)
             time.sleep(0.05)
             if not self.State.IsRunning:
                 return
@@ -2961,6 +3305,7 @@ class AutomatedFishingSystem:
             "soundSensitivity": Settings['FishingModes']['SoundSensitivity'],
             "audioDeviceIndex": Settings['AudioDevice']['SelectedDeviceIndex'],
             "is_admin": self.IsAdmin,
+            "platform": sys.platform,
         }
 
 FlaskApp = Flask(__name__)
@@ -2976,10 +3321,7 @@ MacroSystem = AutomatedFishingSystem()
 
 Port = FindFreePort()
 
-if getattr(sys, 'frozen', False):
-    AppPath = os.path.dirname(sys.executable)
-else:
-    AppPath = os.path.dirname(os.path.abspath(__file__))
+AppPath = GetDataDir()
 
 CleanupOrphanedPortFiles(AppPath)
 
@@ -3002,6 +3344,12 @@ def HealthCheck():
 
 @FlaskApp.route('/check_audio_device', methods=['GET'])
 def CheckAudioDevice():
+    if IsMac:
+        try:
+            Index, Device = FindMacLoopbackDevice()
+            return jsonify({"found": Index is not None, "deviceName": Device['name'] if Device else None})
+        except Exception as E:
+            return jsonify({"found": False, "deviceName": None, "error": str(E)})
     try:
         AudioInterface = pyaudio.PyAudio()
         DeviceFound = False
@@ -3044,6 +3392,15 @@ def CheckAudioDevice():
 
 @FlaskApp.route('/get_audio_devices', methods=['GET'])
 def GetAudioDevices():
+    if IsMac:
+        # Every input is offered: the loopback driver can have any name
+        try:
+            return jsonify({"devices": [
+                {'index': Index, 'name': Device['name'], 'sampleRate': int(Device.get('default_samplerate') or 44100)}
+                for Index, Device in enumerate(sounddevice.query_devices()) if Device['max_input_channels'] > 0
+            ]})
+        except Exception as E:
+            return jsonify({"devices": [], "error": str(E)})
     try:
         AudioInterface = pyaudio.PyAudio()
         Devices = []
@@ -3078,23 +3435,13 @@ def SetFastMode():
             MacroSystem.OcrManager.Enabled = False
             MacroSystem.State.FastModeEnabled = True
 
-            kernel32 = ctypes.windll.kernel32
-            Pid = os.getpid()
-            Handle = kernel32.OpenProcess(0x0200, False, Pid)
-            if Handle:
-                kernel32.SetPriorityClass(Handle, 0x00000020)
-                kernel32.CloseHandle(Handle)
+            SetHighPriority(False)
         else:
             MacroSystem.OcrManager.Enabled = True
             MacroSystem.OcrManager.Initialize()
             MacroSystem.State.FastModeEnabled = False
             
-            kernel32 = ctypes.windll.kernel32
-            Pid = os.getpid()
-            Handle = kernel32.OpenProcess(0x0200, False, Pid)
-            if Handle:
-                kernel32.SetPriorityClass(Handle, 0x00000080)
-                kernel32.CloseHandle(Handle)
+            SetHighPriority(True)
         
         return jsonify({"status": "success", "fastMode": Enabled})
     except Exception as E:
@@ -3328,6 +3675,7 @@ def HandleBackpackLocationPoint(Payload):
     except Exception as E:
         return jsonify({"status": "error", "message": str(E)}), 500
 
+@OnMainThread
 def HandleExportSettings():
     try:
         Root = tk.Tk()
@@ -3355,6 +3703,7 @@ def HandleExportSettings():
         return jsonify({"status": "error", "message": str(E)}), 500
 
 
+@OnMainThread
 def HandleImportSettings():
     try:
         Root = tk.Tk()
@@ -3386,6 +3735,7 @@ def HandleImportSettings():
         return jsonify({"status": "error", "message": str(E)}), 500
 
 
+@OnMainThread
 def HandleResetSettings(Payload):
     if Payload != "confirm":
         return jsonify({"status": "error", "message": "Reset not confirmed"}), 400
@@ -3409,12 +3759,13 @@ def HandleResetSettings(Payload):
 
 def HandleOpenFolder():
     try:
-        os.startfile(os.path.dirname(MacroSystem.Config.ConfigPath))
+        OpenInFileManager(os.path.dirname(MacroSystem.Config.ConfigPath))
         return jsonify({"status": "success"})
     except Exception as E:
         return jsonify({"status": "error", "message": str(E)}), 500
 
 
+@OnMainThread
 def HandleViewConfig():
     try:
         if os.path.exists(MacroSystem.Config.ConfigPath):
@@ -3543,7 +3894,7 @@ def HandleOCRAreaSelector():
     
     def RunSelector():
         try:
-            MacroSystem.ActiveRegionSelector = RegionSelectionWindow(None, MacroSystem.Config.Settings['OCRSettings'], OnOCRRegionComplete)
+            MacroSystem.ActiveRegionSelector = RunOnMainThread(lambda: RegionSelectionWindow(None, MacroSystem.Config.Settings['OCRSettings'], OnOCRRegionComplete))
         finally:
             MacroSystem.RegionSelectorActive = False
             MacroSystem.ActiveRegionSelector = None
@@ -3589,7 +3940,7 @@ def HandleBaitRegionSelector():
 
     def RunSelector():
         try:
-            MacroSystem.ActiveRegionSelector = RegionSelectionWindow(None, MacroSystem.Config.Settings['BaitSelector']['Region'], OnBaitRegionComplete)
+            MacroSystem.ActiveRegionSelector = RunOnMainThread(lambda: RegionSelectionWindow(None, MacroSystem.Config.Settings['BaitSelector']['Region'], OnBaitRegionComplete))
         finally:
             MacroSystem.RegionSelectorActive = False
             MacroSystem.ActiveRegionSelector = None
@@ -3611,7 +3962,12 @@ if __name__ == "__main__":
     # Load OCR (easyocr + torch, several seconds) after the server is up so it doesn't hold up the launcher
     threading.Timer(3.0, MacroSystem.OcrManager.Initialize).start()
     try:
+        # The main thread idles here, running any tkinter work other threads hand it (RunOnMainThread)
         while True:
-            time.sleep(1)
+            try:
+                Task = MainThreadTasks.get(timeout=1)
+            except queue.Empty:
+                continue
+            Task()
     except KeyboardInterrupt:
         os._exit(0)

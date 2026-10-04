@@ -39,6 +39,20 @@ fn resource_dir(app: &AppHandle) -> PathBuf {
     }
 }
 
+// Where the backend writes settings, logs and its port file. Windows keeps them next to the resources; a macOS
+// .app bundle can be read-only (signed or translocated), so there main() moves the working dir to Application Support
+fn data_dir(app: &AppHandle) -> PathBuf {
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        let _ = app;
+        std::env::current_dir().expect("Failed to get current dir")
+    }
+    #[cfg(not(all(target_os = "macos", not(debug_assertions))))]
+    {
+        normalize_path(&resource_dir(app))
+    }
+}
+
 fn normalize_path(path: &PathBuf) -> PathBuf {
     let s = path.to_string_lossy();
     let stripped = s.trim_start_matches("\\\\?\\");
@@ -104,7 +118,11 @@ fn kill_backend_processes() -> u32 {
 #[cfg_attr(debug_assertions, allow(dead_code))]
 fn spawn_backend_process(app: &AppHandle, launcher_pid: u32) -> Result<Child, String> {
     let res_dir = normalize_path(&resource_dir(app));
+    let data_dir = data_dir(app);
+    #[cfg(target_os = "windows")]
     let python_exe = res_dir.join("Python314").join("pythonw.exe");
+    #[cfg(not(target_os = "windows"))]
+    let python_exe = res_dir.join("Python314").join("bin").join("python3");
     let script = res_dir.join("backend.pyc");
 
     log(&format!("Python exe: {:?} (exists: {})", python_exe, python_exe.exists()));
@@ -117,7 +135,7 @@ fn spawn_backend_process(app: &AppHandle, launcher_pid: u32) -> Result<Child, St
         return Err(format!("Backend script not found at {script:?}"));
     }
 
-    let prod_logs = res_dir.join("logs");
+    let prod_logs = data_dir.join("logs");
     let _ = fs::create_dir_all(&prod_logs);
     let stdout_file = fs::File::create(prod_logs.join("backend_stdout.txt")).map_err(|e| e.to_string())?;
     let stderr_file = fs::File::create(prod_logs.join("backend_stderr.txt")).map_err(|e| e.to_string())?;
@@ -126,7 +144,8 @@ fn spawn_backend_process(app: &AppHandle, launcher_pid: u32) -> Result<Child, St
         .arg(&script)
         .arg("--pid")
         .arg(launcher_pid.to_string())
-        .current_dir(&res_dir)
+        .current_dir(&data_dir)
+        .env("GPO_DATA_DIR", &data_dir)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .spawn()
@@ -448,7 +467,7 @@ fn launch_macro(app: AppHandle, macro_name: String) -> Result<serde_json::Value,
     }
 
     let launcher_pid = std::process::id();
-    let res_dir = resource_dir(&app);
+    let res_dir = data_dir(&app);
 
     kill_backend_processes();
 
@@ -521,6 +540,14 @@ fn open_browser(url: String) -> Result<(), String> {
 }
 
 fn main() {
+    // A macOS app starts in "/", which isn't writable
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    if let Some(home) = std::env::var_os("HOME") {
+        let dir = PathBuf::from(home).join("Library/Application Support/com.gpo.ksmacro");
+        let _ = fs::create_dir_all(&dir);
+        let _ = std::env::set_current_dir(&dir);
+    }
+
     let _ = fs::remove_file(logs_dir().join("debug.txt"));
 
     let launcher_pid = std::process::id();
@@ -542,7 +569,7 @@ fn main() {
                 if label == "fish" || label == "hub" {
                     api.prevent_close();
                     let app_handle = window.app_handle().clone();
-                    let res_dir = resource_dir(&app_handle);
+                    let res_dir = data_dir(&app_handle);
                     std::thread::spawn(move || {
                         full_shutdown(&app_handle, launcher_pid, &res_dir);
                         log("Exiting application");

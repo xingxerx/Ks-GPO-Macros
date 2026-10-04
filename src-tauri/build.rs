@@ -214,11 +214,17 @@ fn main() {
 
     if BuildProfile == "release" {
         // The Python install to bundle (with the requirements installed into it). Set GPO_PYTHON_DIR to override
+        // macOS has no standard relocatable install, so it must be given one (e.g. a python-build-standalone build)
+        let TargetIsWindows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
         let PythonSourcePath = env::var("GPO_PYTHON_DIR").map(PathBuf::from).unwrap_or_else(|_| {
-            PathBuf::from(env::var("LOCALAPPDATA").unwrap_or_default()).join(r"Programs\Python\Python314")
+            if TargetIsWindows {
+                PathBuf::from(env::var("LOCALAPPDATA").unwrap_or_default()).join(r"Programs\Python\Python314")
+            } else {
+                PathBuf::new()
+            }
         });
 
-        if !PythonSourcePath.exists() {
+        if PythonSourcePath.as_os_str().is_empty() || !PythonSourcePath.exists() {
             panic!(
                 "Python to bundle not found at {:?}. Install Python 3.14 there or set GPO_PYTHON_DIR to its folder.",
                 PythonSourcePath
@@ -285,7 +291,11 @@ fn main() {
         }
 
         let BackendPy = SrcTauriPath.join("backend.py");
-        let PythonExe = PythonDestinationPath.join("python.exe");
+        let PythonExe = if TargetIsWindows {
+            PythonDestinationPath.join("python.exe")
+        } else {
+            PythonDestinationPath.join("bin").join("python3")
+        };
 
         println!("cargo:rerun-if-changed=backend.py");
 
@@ -295,6 +305,12 @@ fn main() {
         if !PythonDestinationPath.exists() {
             fs::create_dir_all(&PythonDestinationPath)
                 .expect("Failed to create Python314 placeholder directory");
+        }
+        // tauri_build checks every bundled resource exists even in dev, and only release builds compile the
+        // real .pyc (dev runs backend.py directly), so a fresh clone needs an empty stand-in
+        let BackendPyc = SrcTauriPath.join("backend.pyc");
+        if !BackendPyc.exists() {
+            fs::write(&BackendPyc, b"").expect("Failed to create backend.pyc placeholder");
         }
     }
 

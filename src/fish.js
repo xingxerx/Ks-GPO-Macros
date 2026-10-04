@@ -832,7 +832,11 @@ function applyFullState(state) {
 
     if (state.is_admin !== undefined) {
         document.getElementById('adminIndicator').classList.toggle('active', state.is_admin);
-        document.getElementById('adminText').textContent = state.is_admin ? 'Running as Admin' : 'Not Admin';
+        // On macOS the flag is the Accessibility permission, which is what input control needs there
+        const isMac = state.platform === 'darwin';
+        document.getElementById('adminText').textContent = isMac
+            ? (state.is_admin ? 'Accessibility Granted' : 'No Accessibility')
+            : (state.is_admin ? 'Running as Admin' : 'Not Admin');
     }
 
     const portEl = document.getElementById('backendPortDisplay');
