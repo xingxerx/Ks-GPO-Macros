@@ -201,10 +201,11 @@ def SetHighPriority(High):
 
 
 def HasInputPermission():
-    # Windows needs admin to send input to an elevated Roblox; macOS needs the Accessibility permission instead
+    # Windows needs admin to send input to an elevated Roblox; macOS needs Accessibility to send input and Input
+    # Monitoring to hear the hotkeys instead
     try:
         if IsMac:
-            return bool(AXIsProcessTrusted())
+            return bool(AXIsProcessTrusted()) and bool(Quartz.CGPreflightListenEventAccess())
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
     except Exception:
         return False
@@ -287,6 +288,39 @@ def RunOnMainThread(Function):
     if 'Error' in Outcome:
         raise Outcome['Error']
     return Outcome.get('Result')
+
+
+def PumpCocoaEvents(Timeout):
+    # Once tkinter has started the macOS app, its events must keep being handled after the Tk window closes: until
+    # they are, a destroyed window stays on screen frozen and macOS shows the spinning cursor over it
+    from AppKit import NSApplication, NSDate, NSDefaultRunLoopMode
+    App = NSApplication.sharedApplication()
+    Until = NSDate.dateWithTimeIntervalSinceNow_(Timeout)
+    while True:
+        Event = App.nextEventMatchingMask_untilDate_inMode_dequeue_(0xFFFFFFFFFFFFFFFF, Until, NSDefaultRunLoopMode, True)
+        if Event is None:
+            return
+        App.sendEvent_(Event)
+        Until = NSDate.date()
+
+
+def FloatOverFullscreen(Root):
+    # A Tk window opens on the desktop Space, under the always-on-top app window, so it's hidden behind a full-screen
+    # Roblox. Joining every Space as a full-screen auxiliary, above the status level, puts it over the game; macOS only
+    # allows that for accessory apps, which the backend should be anyway (no Dock icon for it)
+    if not IsMac:
+        return
+    try:
+        from AppKit import NSApp
+        NSApp.setActivationPolicy_(1)
+        Root.update_idletasks()
+        for Window in NSApp.windows():
+            if Window.isVisible():
+                Window.setCollectionBehavior_(Window.collectionBehavior() | (1 << 0) | (1 << 8))
+                Window.setLevel_(25)
+        NSApp.activateIgnoringOtherApps_(True)
+    except Exception as E:
+        print(f"FloatOverFullscreen failed: {E}")
 
 
 def OnMainThread(Function):
@@ -1793,21 +1827,36 @@ class RegionSelectionWindow:
         ButtonContainer = tk.Frame(HeaderFrame, bg='#0f172a')
         ButtonContainer.pack(side='right', padx=10, pady=5)
 
-        self.ConfirmButton = tk.Button(
-            ButtonContainer,
-            text="✓ Confirm",
-            command=self.CloseWindow,
-            bg='#10b981',
-            fg='white',
-            font=('Segoe UI', 9, 'bold'),
-            padx=20,
-            pady=8,
-            cursor='hand2',
-            relief='flat',
-            borderwidth=0,
-            activebackground='#059669',
-            activeforeground='white'
-        )
+        if IsMac:
+            # A native macOS button swallows the first click while the window is inactive (and ignores bg), so the
+            # selector needed two clicks to confirm; a Tk-drawn label acts on the first
+            self.ConfirmButton = tk.Label(
+                ButtonContainer,
+                text="✓ Confirm",
+                bg='#10b981',
+                fg='white',
+                font=('Helvetica', 12, 'bold'),
+                padx=20,
+                pady=6,
+                cursor='hand2'
+            )
+            self.ConfirmButton.bind('<ButtonRelease-1>', lambda e: self.CloseWindow())
+        else:
+            self.ConfirmButton = tk.Button(
+                ButtonContainer,
+                text="✓ Confirm",
+                command=self.CloseWindow,
+                bg='#10b981',
+                fg='white',
+                font=('Segoe UI', 9, 'bold'),
+                padx=20,
+                pady=8,
+                cursor='hand2',
+                relief='flat',
+                borderwidth=0,
+                activebackground='#059669',
+                activeforeground='white'
+            )
         self.ConfirmButton.pack(side='right')
 
         self.ConfirmButton.bind('<Enter>', lambda e: self.ConfirmButton.config(bg='#059669'))
@@ -1838,7 +1887,18 @@ class RegionSelectionWindow:
         self.Canvas.bind('<Motion>', self.HandleMouseHover)
         
         self.RootWindow.protocol("WM_DELETE_WINDOW", self.CloseWindow)
-        
+
+        if IsMac:
+            # Tk 9 on macOS keeps the title bar of a window made borderless before it's first shown, and ignores where
+            # it was placed, so redo both once it's up
+            self.RootWindow.update()
+            self.RootWindow.withdraw()
+            self.RootWindow.overrideredirect(True)
+            self.RootWindow.deiconify()
+            self.RootWindow.geometry(f"{Width}x{Height}+{self.LeftBoundary}+{self.TopBoundary}")
+            self.RootWindow.update()
+            FloatOverFullscreen(self.RootWindow)
+
         self.RootWindow.mainloop()
 
     def CreateCornerIndicators(self):
@@ -1948,8 +2008,9 @@ class RegionSelectionWindow:
         self.IsWindowClosed = True
         
         try:
-            Left = self.RootWindow.winfo_x()
-            Top = self.RootWindow.winfo_y()
+            # The content's screen position, which on macOS sits below the window frame's top
+            Left = self.RootWindow.winfo_rootx()
+            Top = self.RootWindow.winfo_rooty()
             Right = Left + self.RootWindow.winfo_width()
             Bottom = Top + self.RootWindow.winfo_height()
             Coords = {"X1": Left, "Y1": Top, "X2": Right, "Y2": Bottom}
@@ -1972,7 +2033,7 @@ class PointSelector:
     def StartSelection(self, PointName, Callback):
         if self.MouseListener:
             self.MouseListener.stop()
-        
+
         self.CurrentlySettingPoint = PointName
         StartTime = time.time()
         
@@ -3963,11 +4024,15 @@ if __name__ == "__main__":
     threading.Timer(3.0, MacroSystem.OcrManager.Initialize).start()
     try:
         # The main thread idles here, running any tkinter work other threads hand it (RunOnMainThread)
+        CocoaStarted = False
         while True:
             try:
-                Task = MainThreadTasks.get(timeout=1)
+                Task = MainThreadTasks.get(timeout=1) if not CocoaStarted else MainThreadTasks.get_nowait()
             except queue.Empty:
+                if CocoaStarted:
+                    PumpCocoaEvents(0.05)
                 continue
             Task()
+            CocoaStarted = IsMac
     except KeyboardInterrupt:
         os._exit(0)

@@ -809,7 +809,7 @@ async function loadInitialSettings() {
             console.log(`Settings loaded on attempt ${attempt}`);
             return;
         } catch (e) {
-            console.log(`Backend not ready (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${RETRY_DELAY}ms...`);
+            flog(`loadInitialSettings attempt ${attempt}/${MAX_ATTEMPTS} failed: ${e?.stack || e}`);
             if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, RETRY_DELAY));
         }
     }
@@ -832,10 +832,10 @@ function applyFullState(state) {
 
     if (state.is_admin !== undefined) {
         document.getElementById('adminIndicator').classList.toggle('active', state.is_admin);
-        // On macOS the flag is the Accessibility permission, which is what input control needs there
+        // On macOS the flag is Accessibility plus Input Monitoring, which input control and the hotkeys need there
         const isMac = state.platform === 'darwin';
         document.getElementById('adminText').textContent = isMac
-            ? (state.is_admin ? 'Accessibility Granted' : 'No Accessibility')
+            ? (state.is_admin ? 'Input Access Granted' : 'Needs Accessibility + Input Monitoring')
             : (state.is_admin ? 'Running as Admin' : 'Not Admin');
     }
 
@@ -861,7 +861,12 @@ async function pollPythonState() {
         } else {
             applyLiveState(state);
         }
-    } catch (e) { }
+    } catch (e) {
+        // A failing full sync leaves every setting at its page default ("Not Set" points), so say why, once
+        const msg = `pollPythonState (${full ? 'full' : 'live'}) failed: ${e?.stack || e}`;
+        if (msg !== window.lastPollError) flog(msg);
+        window.lastPollError = msg;
+    }
 }
 
 function startPolling() {

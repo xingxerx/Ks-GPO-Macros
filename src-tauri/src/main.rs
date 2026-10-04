@@ -421,6 +421,8 @@ fn start_window_watcher(app: &AppHandle, backend_port: u16) {
             if last_on_top != Some(on_top) {
                 if let Some(win) = app.get_webview_window("fish") {
                     let _ = win.set_always_on_top(on_top);
+                    #[cfg(target_os = "macos")]
+                    pin_over_fullscreen(&app, &win, on_top);
                 }
                 last_on_top = Some(on_top);
             }
@@ -435,6 +437,25 @@ fn start_window_watcher(app: &AppHandle, backend_port: u16) {
                 last_show_overlay = Some(show_overlay);
             }
         }
+    });
+}
+
+// macOS gives a full-screen app its own Space, and a floating window alone stays behind on the desktop. Joining every
+// Space as a full-screen auxiliary follows Roblox there, which macOS only allows for accessory apps, so the Dock icon
+// is hidden while the window is pinned
+#[cfg(target_os = "macos")]
+fn pin_over_fullscreen(app: &AppHandle, win: &tauri::WebviewWindow, on_top: bool) {
+    use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+
+    let policy = if on_top { tauri::ActivationPolicy::Accessory } else { tauri::ActivationPolicy::Regular };
+    let _ = app.set_activation_policy(policy);
+    let Ok(ns_window) = win.ns_window() else { return };
+    let ns_window = ns_window as usize;
+    let _ = win.run_on_main_thread(move || {
+        let ns_window = unsafe { &*(ns_window as *const NSWindow) };
+        let mut behavior = ns_window.collectionBehavior();
+        behavior.set(NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary, on_top);
+        ns_window.setCollectionBehavior(behavior);
     });
 }
 

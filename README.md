@@ -68,7 +68,7 @@ and hotkeys, AppKit to focus Roblox).
 
 - **Permissions** - in System Settings > Privacy & Security, allow the app (or your terminal, in dev) under
   **Accessibility**, **Input Monitoring** and **Screen Recording**, then restart it. The sidebar shows
-  "Accessibility Granted" once input control is allowed.
+  "Input Access Granted" once Accessibility and Input Monitoring are both allowed.
 - **Tkinter** - region selectors use Tk. python.org and python-build-standalone builds include it; with Homebrew,
   `brew install python-tk`.
 - **Megalodon sound** - macOS can't record app audio directly. Install [BlackHole](https://github.com/ExistentialAudio/BlackHole),
