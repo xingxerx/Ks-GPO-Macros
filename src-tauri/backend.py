@@ -74,8 +74,15 @@ if IsMac:
             Name = Name.strip().lower()
             return self.Aliases.get(Name, Name)
 
+        # pynput maps these characters to their numeric keypad keys (1 -> keypad 1), which Roblox doesn't treat as
+        # hotbar keys, so the rod and fruit slots never equipped. Send the main-row ANSI key codes instead
+        MainRowKeyCodes = {'1': 18, '2': 19, '3': 20, '4': 21, '5': 23, '6': 22, '7': 26, '8': 28, '9': 25, '0': 29,
+                           '-': 27, '=': 24, '.': 47, '/': 44}
+
         def ToKey(self, Name):
             Name = self.Normalize(Name)
+            if Name in self.MainRowKeyCodes:
+                return PynputKeyboard.KeyCode.from_vk(self.MainRowKeyCodes[Name], char=Name)
             if len(Name) == 1:
                 return PynputKeyboard.KeyCode.from_char(Name)
             Key = getattr(PynputKeyboard.Key, Name, None)
@@ -150,7 +157,11 @@ if IsMac:
             self.release(Name)
 
         def write(self, Text):
-            self.Controller.type(Text)
+            for Char in Text:
+                if Char in self.MainRowKeyCodes:
+                    self.press_and_release(Char)
+                else:
+                    self.Controller.type(Char)
 
     keyboard = MacKeyboard()
 
@@ -229,12 +240,18 @@ def GetDataDir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-class RetinaSafeCapture:
-    # On Retina screens mss returns 2x the requested size, while regions and click points (pyautogui, pynput,
-    # tkinter) are in points, and every detector here assumes one pixel per point. Sampling back down with
-    # nearest-neighbour keeps colours exact, which the exact-match colour masks rely on
+class MacScreenCapture:
+    # Two things make raw macOS captures miss the detectors' exact-match colours. They come back in the display's
+    # colour profile, not sRGB (the bar's blue 85,170,255 reads as 75,160,255 on a monitor with its own profile, so
+    # the minigame bar was never found), and on Retina screens at 2x the size of the point coordinates that regions
+    # and clicks use. Drawing each capture into a point-sized sRGB bitmap without interpolation fixes both, at the
+    # same speed as mss. mss stays underneath for anything else it offers (monitors)
+    SRGB = None
+
     def __init__(self, Inner):
         self.Inner = Inner
+        if MacScreenCapture.SRGB is None:
+            MacScreenCapture.SRGB = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB)
 
     def __getattr__(self, Name):
         return getattr(self.Inner, Name)
@@ -246,21 +263,204 @@ class RetinaSafeCapture:
         self.Inner.close()
 
     def grab(self, Monitor):
-        Shot = self.Inner.grab(Monitor)
         if isinstance(Monitor, tuple):
             Monitor = {'left': Monitor[0], 'top': Monitor[1], 'width': Monitor[2] - Monitor[0], 'height': Monitor[3] - Monitor[1]}
-        Width, Height = Monitor['width'], Monitor['height']
-        if (Shot.width, Shot.height) == (Width, Height):
-            return Shot
-        Pixels = np.frombuffer(Shot.raw, dtype=np.uint8).reshape(Shot.height, Shot.width, 4)
-        Rows = np.arange(Height) * Shot.height // Height
-        Cols = np.arange(Width) * Shot.width // Width
-        Pixels = np.ascontiguousarray(Pixels[Rows][:, Cols])
-        return ScreenShot(bytearray(Pixels.tobytes()), Monitor, size=Size(Width, Height))
+        Left, Top, Width, Height = Monitor['left'], Monitor['top'], Monitor['width'], Monitor['height']
+        Image = Quartz.CGWindowListCreateImage(Quartz.CGRectMake(Left, Top, Width, Height),
+                                               Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID,
+                                               Quartz.kCGWindowImageNominalResolution)
+        Context = Quartz.CGBitmapContextCreate(None, Width, Height, 8, Width * 4, self.SRGB,
+                                               Quartz.kCGImageAlphaPremultipliedFirst | Quartz.kCGBitmapByteOrder32Little)
+        Quartz.CGContextSetInterpolationQuality(Context, Quartz.kCGInterpolationNone)
+        if Image is not None:
+            Quartz.CGContextDrawImage(Context, Quartz.CGRectMake(0, 0, Width, Height), Image)
+        Pixels = bytearray(Quartz.CGBitmapContextGetData(Context).as_buffer(Width * Height * 4))
+        return ScreenShot(Pixels, Monitor, size=Size(Width, Height))
+
+    def grab_live(self, Monitor):
+        # For regions read every frame (the minigame): the newest streamed frame, or a snapshot if streaming fails
+        Pixels = MacLiveCapture.Grab(Monitor)
+        if Pixels is None:
+            return self.grab(Monitor)
+        return ScreenShot(bytearray(Pixels.tobytes()), Monitor, size=Size(Monitor['width'], Monitor['height']))
+
+
+class MacLiveCapture:
+    # The minigame reads the same region every frame, and a snapshot costs ~13ms on macOS whatever its size, which
+    # held the loop near 50fps with extra lag (Windows runs several times faster, so the zone followed the fish more
+    # smoothly there). ScreenCaptureKit instead streams the region as the screen draws it, in sRGB so the colours
+    # stay exact, and a grab just takes the newest frame. One stream at a time; it stops once nothing reads it
+    Lock = threading.Lock()
+    NewFrame = threading.Condition()
+    Stream = None
+    Output = None
+    Queue = None
+    Region = None
+    Scale = 1
+    Frame = None
+    Seq = 0
+    ReturnedSeq = 0
+    LastUse = 0.0
+    Failed = False
+    IdleWatcher = None
+
+    @classmethod
+    def Grab(cls, Monitor):
+        # Returns the newest frame (BGRA array) of the region, or None to fall back to a snapshot
+        Region = (Monitor['left'], Monitor['top'], Monitor['width'], Monitor['height'])
+        with cls.Lock:
+            cls.LastUse = time.time()
+            if cls.Failed:
+                return None
+            if cls.Region != Region:
+                cls.Stop()
+                try:
+                    cls.Start(Region)
+                except Exception as E:
+                    LogLine(f"Live capture unavailable, using snapshots: {E}")
+                    cls.Failed = True
+                    return None
+        with cls.NewFrame:
+            # Wait for a frame newer than the last one handed out, which paces the loop to the screen. A still
+            # screen sends no frames, so after a short wait the latest one is still current
+            cls.NewFrame.wait_for(lambda: cls.Seq > cls.ReturnedSeq, timeout=0.5 if cls.Frame is None else 1 / 30)
+            if cls.Frame is None:
+                return None
+            cls.ReturnedSeq = cls.Seq
+            return cls.Frame
+
+    @classmethod
+    def Start(cls, Region):
+        import ScreenCaptureKit, CoreMedia, dispatch
+        from AppKit import NSScreen
+        Left, Top, Width, Height = Region
+
+        Ready = threading.Event()
+        Result = {}
+
+        def OnContent(Content, Error):
+            Result['Content'], Result['Error'] = Content, Error
+            Ready.set()
+
+        ScreenCaptureKit.SCShareableContent.getShareableContentWithCompletionHandler_(OnContent)
+        if not Ready.wait(3) or Result.get('Error') is not None or Result.get('Content') is None:
+            raise RuntimeError(f"no shareable content ({Result.get('Error')})")
+
+        # The display holding the region; source rects are relative to it, in points
+        Display = None
+        for Candidate in Result['Content'].displays():
+            Frame = Candidate.frame()
+            if Frame.origin.x <= Left < Frame.origin.x + Frame.size.width and Frame.origin.y <= Top < Frame.origin.y + Frame.size.height:
+                Display = Candidate
+                break
+        if Display is None:
+            raise RuntimeError("region is not on any display")
+        Origin = Display.frame().origin
+        cls.Scale = max(1, round(Quartz.CGDisplayPixelsWide(Display.displayID()) / Display.width()))
+
+        Config = ScreenCaptureKit.SCStreamConfiguration.alloc().init()
+        Config.setSourceRect_(Quartz.CGRectMake(Left - Origin.x, Top - Origin.y, Width, Height))
+        # Native pixels, sampled back down to points without blending (blending would break the exact colours)
+        Config.setWidth_(Width * cls.Scale)
+        Config.setHeight_(Height * cls.Scale)
+        Config.setPixelFormat_(1111970369)  # kCVPixelFormatType_32BGRA
+        Config.setColorSpaceName_(Quartz.kCGColorSpaceSRGB)
+        Config.setMinimumFrameInterval_(CoreMedia.CMTimeMake(1, 240))
+        Config.setQueueDepth_(3)
+        Config.setShowsCursor_(False)
+
+        Filter = ScreenCaptureKit.SCContentFilter.alloc().initWithDisplay_excludingWindows_(Display, [])
+        cls.Output = cls.OutputClass().alloc().init()
+        Stream = ScreenCaptureKit.SCStream.alloc().initWithFilter_configuration_delegate_(Filter, Config, cls.Output)
+        # Held on the class: the stream doesn't keep the Python queue object alive, and frames stop once it's freed
+        if cls.Queue is None:
+            cls.Queue = dispatch.dispatch_queue_create(b'gpo.livecapture', None)
+        Added, Error = Stream.addStreamOutput_type_sampleHandlerQueue_error_(cls.Output, 0, cls.Queue, None)
+        if not Added:
+            raise RuntimeError(f"could not add stream output ({Error})")
+
+        Started = threading.Event()
+
+        def OnStart(Error):
+            Result['StartError'] = Error
+            Started.set()
+
+        Stream.startCaptureWithCompletionHandler_(OnStart)
+        if not Started.wait(3) or Result.get('StartError') is not None:
+            raise RuntimeError(f"stream did not start ({Result.get('StartError')})")
+
+        cls.Stream, cls.Region, cls.Frame = Stream, Region, None
+        if cls.IdleWatcher is None:
+            cls.IdleWatcher = threading.Thread(target=cls.StopWhenIdle, daemon=True)
+            cls.IdleWatcher.start()
+
+    @classmethod
+    def OutputClass(cls):
+        # Defined only after ScreenCaptureKit is imported and declared as its protocols: built earlier, pyobjc
+        # gave the callbacks generic signatures and the stream never delivered a frame
+        if '_OutputClass' not in cls.__dict__:
+            import objc
+            from Foundation import NSObject
+
+            class MacLiveCaptureOutput(NSObject, protocols=[objc.protocolNamed('SCStreamOutput'), objc.protocolNamed('SCStreamDelegate')]):
+                def stream_didOutputSampleBuffer_ofType_(self, Stream, SampleBuffer, OutputType):
+                    if OutputType == 0:  # SCStreamOutputTypeScreen
+                        MacLiveCapture.OnFrame(SampleBuffer)
+
+                def stream_didStopWithError_(self, Stream, Error):
+                    MacLiveCapture.OnStopped(Error)
+
+            cls._OutputClass = MacLiveCaptureOutput
+        return cls._OutputClass
+
+    @classmethod
+    def Stop(cls):
+        if cls.Stream is not None:
+            try:
+                cls.Stream.stopCaptureWithCompletionHandler_(None)
+            except Exception:
+                pass
+        cls.Stream, cls.Output, cls.Region, cls.Frame = None, None, None, None
+
+    @classmethod
+    def StopWhenIdle(cls):
+        # A running stream keeps the screen-recording indicator on and costs a little CPU; drop it between fish
+        while True:
+            time.sleep(1)
+            with cls.Lock:
+                if cls.Stream is not None and time.time() - cls.LastUse > 3:
+                    cls.Stop()
+
+    @classmethod
+    def OnFrame(cls, SampleBuffer):
+        import CoreMedia
+        PixelBuffer = CoreMedia.CMSampleBufferGetImageBuffer(SampleBuffer)
+        if PixelBuffer is None:
+            return
+        Quartz.CVPixelBufferLockBaseAddress(PixelBuffer, 1)
+        try:
+            Width = Quartz.CVPixelBufferGetWidth(PixelBuffer)
+            Height = Quartz.CVPixelBufferGetHeight(PixelBuffer)
+            RowBytes = Quartz.CVPixelBufferGetBytesPerRow(PixelBuffer)
+            Raw = Quartz.CVPixelBufferGetBaseAddress(PixelBuffer).as_buffer(RowBytes * Height)
+            Pixels = np.frombuffer(Raw, np.uint8).reshape(Height, RowBytes // 4, 4)[::cls.Scale, :Width:cls.Scale]
+            Pixels = np.ascontiguousarray(Pixels)
+        finally:
+            Quartz.CVPixelBufferUnlockBaseAddress(PixelBuffer, 1)
+        with cls.NewFrame:
+            cls.Frame = Pixels
+            cls.Seq += 1
+            cls.NewFrame.notify_all()
+
+    @classmethod
+    def OnStopped(cls, Error):
+        LogLine(f"Live capture stopped: {Error}")
+        with cls.Lock:
+            cls.Stream, cls.Output, cls.Region, cls.Frame = None, None, None, None
 
 
 def NewScreenCapture():
-    return RetinaSafeCapture(mss.mss()) if IsMac else mss.mss()
+    return MacScreenCapture(mss.mss()) if IsMac else mss.mss()
 
 
 MainThreadTasks = queue.Queue()
@@ -401,7 +601,7 @@ class ConfigurationManager:
         MonitorWidth, MonitorHeight = GetScreenSize()
         
         return {
-            'Hotkeys': {'StartStop': 'f1', 'Exit': 'f3'},
+            'Hotkeys': {'StartStop': 'f1', 'Exit': 'f3', 'HideGui': 'f4'},
             'WindowSettings': {'AlwaysOnTop': True, 'ShowDebugOverlay': False},
             'ScanArea': {
                 'X1': int(MonitorWidth * 0.52461),
@@ -468,12 +668,15 @@ class ConfigurationManager:
                 'DeviceName': ''
             },
             'FishingControl': {
+                # On macOS the catch zone overshot back and forth with the Windows tuning: it takes ~0.25s to stop,
+                # longer than the Windows lead time looks ahead (Roblox there can run at the display's higher rate,
+                # and capture adds latency). A longer lead brakes it in time
                 'PdController': {
                     'Kp': 1.0,
-                    'Kd': 0.6,
+                    'Kd': 2.0 if IsMac else 0.6,
                     'PdClamp': 1.0,
-                    'PdApproachingDamping': 2.0,
-                    'PdChasingDamping': 0.5
+                    'PdApproachingDamping': 3.0 if IsMac else 2.0,
+                    'PdChasingDamping': 1.0 if IsMac else 0.5
                 },
                 'Timing': {
                     'CastHoldDuration': 0.1,
@@ -2077,7 +2280,8 @@ class FishingMinigameController:
             if Elapsed >= MaxTimeout:
                 return False
 
-            Image = np.array(Capture.grab({
+            # grab_live (macOS) streams the region instead of snapshotting it every frame
+            Image = np.array(getattr(Capture, 'grab_live', Capture.grab)({
                 "top": ScanArea["Y1"],
                 "left": ScanArea["X1"],
                 "width": ScanArea["X2"] - ScanArea["X1"],
@@ -2251,7 +2455,7 @@ class FishingMinigameController:
         Capture = self.GetCapture()
         Height = ScanArea["Y2"] - ScanArea["Y1"]
 
-        Image = np.array(Capture.grab({"top": ScanArea["Y1"], "left": ScanArea["X1"],
+        Image = np.array(getattr(Capture, 'grab_live', Capture.grab)({"top": ScanArea["Y1"], "left": ScanArea["X1"],
                                        "width": ScanArea["X2"] - ScanArea["X1"], "height": Height}))
         Now = time.time()
         self.Snapshot(Image, 'start')
@@ -2387,6 +2591,8 @@ class AutomatedFishingSystem:
         self.FastMode = False
         
         self.CurrentlyRebindingHotkey = None
+        # Flipped by the hide hotkey; the launcher watches it and hides or shows the main window
+        self.GuiHidden = False
         self.ToggleLock = Lock()
         self.LoopThread = None
 
@@ -2397,9 +2603,13 @@ class AutomatedFishingSystem:
             Hotkeys = self.Config.Settings['Hotkeys']
             keyboard.add_hotkey(Hotkeys['StartStop'], self.ToggleMacro)
             keyboard.add_hotkey(Hotkeys['Exit'], self.TerminateApp)
+            keyboard.add_hotkey(Hotkeys['HideGui'], self.ToggleGui)
         except Exception as E:
             print(f"Error setting up hotkeys: {E}")
     
+    def ToggleGui(self):
+        self.GuiHidden = not self.GuiHidden
+
     def ToggleMacro(self):
         # The hotkey and the UI can both toggle; serialize so a double press can't start two loops
         with self.ToggleLock:
@@ -2576,6 +2786,9 @@ class AutomatedFishingSystem:
 
                 self.State.UpdateStatus("Waiting for bobber to appear")
                 if not self.MinigameController.WaitForBobber():
+                    # Stopping the macro also ends the wait; that's not a timeout to count or report
+                    if not self.State.IsRunning:
+                        break
                     self.State.UpdateStatus("Bobber timeout - recasting")
                     self.State.HandleRecastTimeout()
                     # A cast that never produced a bobber usually means the rod wasn't in hand (a dropped key
@@ -3267,6 +3480,7 @@ class AutomatedFishingSystem:
         Window = self.Config.Settings['WindowSettings']
         return {
             "isRunning": State.IsRunning,
+            "guiHidden": self.GuiHidden,
             "currentStatus": State.CurrentStatus,
             "fishCaught": State.TotalFishCaught,
             "devilFruitsCaught": State.TotalDevilFruits,

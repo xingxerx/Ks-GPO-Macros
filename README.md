@@ -39,6 +39,7 @@ Start and stop fishing with `F1` or the Start button in the sidebar.
 
 - `F1` - Start/Stop
 - `F3` - Exit
+- `F4` - Hide/show the main window
 
 You can rebind these in the UI.
 

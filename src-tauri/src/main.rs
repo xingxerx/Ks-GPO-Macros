@@ -401,8 +401,8 @@ fn setup_stats_window(app: &AppHandle) {
     });
 }
 
-// One watcher for both window behaviours that follow backend settings: the main window's always-on-top and the
-// overlay, which is only shown while the macro runs. Windows are only touched when a value actually changes
+// One watcher for the window behaviours that follow the backend: the main window's always-on-top, its hide hotkey,
+// and the overlay, which is only shown while the macro runs. Windows are only touched when a value actually changes
 fn start_window_watcher(app: &AppHandle, backend_port: u16) {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::SeqCst) {
@@ -413,8 +413,11 @@ fn start_window_watcher(app: &AppHandle, backend_port: u16) {
     std::thread::spawn(move || {
         let mut last_on_top: Option<bool> = None;
         let mut last_show_overlay: Option<bool> = None;
+        // The window starts shown, so only a press of the hide hotkey changes it
+        let mut last_hidden = false;
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            // Short enough that the hide hotkey feels immediate; the live state is a small request
+            std::thread::sleep(std::time::Duration::from_millis(400));
             let Some(state) = fetch_live_state(backend_port) else { continue };
 
             let on_top = state.get("alwaysOnTop").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -425,6 +428,14 @@ fn start_window_watcher(app: &AppHandle, backend_port: u16) {
                     pin_over_fullscreen(&app, &win, on_top);
                 }
                 last_on_top = Some(on_top);
+            }
+
+            let hidden = state.get("guiHidden").and_then(|v| v.as_bool()).unwrap_or(false);
+            if hidden != last_hidden {
+                if let Some(win) = app.get_webview_window("fish") {
+                    let _ = if hidden { win.hide() } else { win.show() };
+                }
+                last_hidden = hidden;
             }
 
             let enabled = state.get("showDebugOverlay").and_then(|v| v.as_bool()).unwrap_or(false);

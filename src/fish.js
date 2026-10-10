@@ -706,6 +706,7 @@ function loadAllSettings(state) {
     if (state.hotkeys) {
         updateHotkey('start', state.hotkeys.StartStop || state.hotkeys.start_stop || 'f1');
         updateHotkey('exit', state.hotkeys.Exit || state.hotkeys.exit || 'f3');
+        updateHotkey('hide', state.hotkeys.HideGui || 'f4');
     }
     setInputValue('rodHotkey', state.rodHotkey || '1');
     setInputValue('anythingElseHotkey', state.anythingElseHotkey || '2');
