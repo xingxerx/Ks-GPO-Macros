@@ -152,8 +152,14 @@ if IsMac:
         def release(self, Name):
             self.Controller.release(self.ToKey(Name))
 
+        # Roblox on macOS drops zero-length taps and keys sent back to back (typing the bait quantity 20 landed as
+        # 2), where the `keyboard` package on Windows gets through. Hold each key briefly and space the characters
+        TapHold = 0.03
+        CharGap = 0.06
+
         def press_and_release(self, Name):
             self.press(Name)
+            time.sleep(self.TapHold)
             self.release(Name)
 
         def write(self, Text):
@@ -161,7 +167,10 @@ if IsMac:
                 if Char in self.MainRowKeyCodes:
                     self.press_and_release(Char)
                 else:
-                    self.Controller.type(Char)
+                    self.Controller.press(Char)
+                    time.sleep(self.TapHold)
+                    self.Controller.release(Char)
+                time.sleep(self.CharGap)
 
     keyboard = MacKeyboard()
 
@@ -668,15 +677,15 @@ class ConfigurationManager:
                 'DeviceName': ''
             },
             'FishingControl': {
-                # On macOS the catch zone overshot back and forth with the Windows tuning: it takes ~0.25s to stop,
-                # longer than the Windows lead time looks ahead (Roblox there can run at the display's higher rate,
-                # and capture adds latency). A longer lead brakes it in time
+                # The same tuning on both platforms. macOS once had a 5x longer lead (Kd 2.0, damping 3.0/1.0) for a
+                # zone that overshot, but that overshoot was the zone reading splitting around the fish line (see
+                # LocateBar), and the 0.6s lead itself made the zone brake early and bob
                 'PdController': {
                     'Kp': 1.0,
-                    'Kd': 2.0 if IsMac else 0.6,
+                    'Kd': 0.6,
                     'PdClamp': 1.0,
-                    'PdApproachingDamping': 3.0 if IsMac else 2.0,
-                    'PdChasingDamping': 1.0 if IsMac else 0.5
+                    'PdApproachingDamping': 2.0,
+                    'PdChasingDamping': 0.5
                 },
                 'Timing': {
                     'CastHoldDuration': 0.1,
@@ -2264,7 +2273,15 @@ class FishingMinigameController:
     def __init__(self, Config, State):
         self.Config = Config
         self.State = State
-    
+        # Learned zone accelerations (px/s^2), kept across fish (see LearnAcceleration)
+        self.AccelUp = None
+        self.AccelDown = None
+        self.AccelRef = None
+        self.InputChangedAt = 0.0
+        self.Latency = None
+        self.LastRelDirection = 0
+        self.SwingPeak = 0.0
+
     def WaitForBobber(self):
         StartTime = time.time()
         BarFrames = 0
@@ -2327,6 +2344,10 @@ class FishingMinigameController:
         self.SnapshotReasons = set()
         self.LastTraceTime = 0.0
         self.MinigameStart = time.time()
+        self.AccelRef = None
+        self.InputChangedAt = time.time()
+        self.LastRelDirection = 0
+        self.SwingPeak = 0.0
 
     def Snapshot(self, Image, Reason):
         # One screenshot per reason per minigame, capped per session, so the folder stays small
@@ -2424,14 +2445,21 @@ class FishingMinigameController:
         WhiteHeight = White[-1] - White[0] + 1
         WhiteCenter = int((White[0] + White[-1]) // 2)
 
-        # Split the catch zone into contiguous groups and follow the largest
-        ZoneGroups = cls.Groups(GrayRows, max(WhiteHeight * GapMultiplier, 3))
+        # Split the catch zone into the runs between blue and follow the one with the most gray. Splitting on gaps in
+        # the gray alone cut the zone in two whenever the fish line sat inside it (its anti-aliased edge rows are
+        # neither gray nor white, widening the gap), and following the bigger half made the zone centre jump by tens
+        # of pixels, so the zone bobbed around a fish that wasn't moving. The line and its edges aren't blue, so
+        # they stay inside the zone they cross
+        NotBlue = Bar[~IsBlue[Bar]]
+        ZoneGroups = [G[IsGray[G]] for G in cls.Groups(NotBlue, max(WhiteHeight * GapMultiplier, 3))]
+        ZoneGroups = [G for G in ZoneGroups if len(G)]
         Zone = max(ZoneGroups, key=len)
         TargetCenter = int((Zone[0] + Zone[-1]) // 2)
 
         return {
             'CenterX': CenterX, 'WhiteCenter': WhiteCenter, 'WhiteHeight': WhiteHeight,
-            'TargetCenter': TargetCenter, 'Groups': len(ZoneGroups), 'Top': int(Top), 'Bottom': int(Bottom)
+            'TargetCenter': TargetCenter, 'Groups': len(ZoneGroups), 'Top': int(Top), 'Bottom': int(Bottom),
+            'ZoneTop': int(Zone[0]), 'ZoneBottom': int(Zone[-1])
         }, None
 
     def SetMouse(self, Hold, Now):
@@ -2439,16 +2467,85 @@ class FishingMinigameController:
             pyautogui.mouseDown()
             self.State.MousePressed = True
             self.State.LastInputResendTime = Now
+            self.InputChangedAt = Now
         elif not Hold and self.State.MousePressed:
             pyautogui.mouseUp()
             self.State.MousePressed = False
             self.State.LastInputResendTime = Now
+            self.InputChangedAt = Now
         elif Now - getattr(self.State, 'LastInputResendTime', 0) >= self.Config.Settings['FishingControl']['Timing']['StateResendInterval']:
             if self.State.MousePressed:
                 pyautogui.mouseDown()
             else:
                 pyautogui.mouseUp()
             self.State.LastInputResendTime = Now
+
+    def LearnAcceleration(self, Reading, Now, Latency):
+        # The zone accelerates up while held and falls while released. Measure each from the zone's velocity change
+        # once the input has been steady long enough to take effect, skipping frames where it rests on a bar end
+        BarLength = max(Reading['Bottom'] - Reading['Top'], 1)
+        if self.AccelUp is None:
+            # ~2 bar lengths/s^2 both ways, what the zone showed in traces; refined from there
+            self.AccelUp = self.AccelDown = 2.0 * BarLength
+        Held = self.State.MousePressed
+        Pinned = Reading['ZoneTop'] - Reading['Top'] <= 3 or Reading['Bottom'] - Reading['ZoneBottom'] <= 3
+        if Pinned or Now - self.InputChangedAt < Latency + 0.1:
+            self.AccelRef = None
+            return
+        if self.AccelRef is None or self.AccelRef[2] != Held:
+            self.AccelRef = (Now, self.TargetVel, Held)
+            return
+        Dt = Now - self.AccelRef[0]
+        if Dt < 0.15:
+            return
+        Measured = (self.AccelRef[1] - self.TargetVel if Held else self.TargetVel - self.AccelRef[1]) / Dt
+        if 0.3 * BarLength <= Measured <= 10 * BarLength:
+            if Held:
+                self.AccelUp = 0.7 * self.AccelUp + 0.3 * Measured
+            else:
+                self.AccelDown = 0.7 * self.AccelDown + 0.3 * Measured
+        self.AccelRef = (Now, self.TargetVel, Held)
+
+    def LearnLatency(self, Error, Rel, BarLength):
+        # How long an input takes to show up in the captured zone (Roblox, the capture stream and the velocity
+        # filter together) isn't known up front and drifts with frame rate, and the controller is only as good as
+        # this guess. Check it each time the zone turns around from a real swing: stopping past the line means it
+        # braked too late (latency underestimated), stopping short means too early. Hovering on the line makes
+        # the velocity jitter around zero, so turnarounds without a real swing before them are ignored
+        Direction = 1 if Rel > 0 else -1 if Rel < 0 else 0
+        if self.LastRelDirection and Direction and Direction != self.LastRelDirection:
+            if self.SwingPeak >= 0.2 * BarLength and abs(Error) < 0.3 * BarLength:
+                # Positive Overshoot: the zone ended up past the line in the direction it had been moving
+                Overshoot = -Error * self.LastRelDirection
+                self.Latency = max(0.02, min(0.3, self.Latency + 0.0004 * Overshoot))
+            self.SwingPeak = 0.0
+        self.SwingPeak = max(self.SwingPeak, abs(Rel))
+        if Direction:
+            self.LastRelDirection = Direction
+
+    def PredictByStoppingDistance(self, Reading, Error, Now, Pd, MaxLead):
+        # The zone has momentum: in macOS traces it took over half a second to turn around from ~450px/s. A fixed
+        # look-ahead (Error + rate * lead time) can't handle that, since braking distance grows with the square of
+        # speed: short leads overshot and long ones braked early, and either way the zone bobbed around the fish.
+        # Instead predict where the zone would stop if it started braking once the input takes effect, and only
+        # brake when that point reaches the fish line. Latency and both accelerations are learned while fishing;
+        # Kd sets the starting latency (0.6 -> 120ms) and Approaching Damping scales the braking distance
+        # (2.0 = as measured), so the existing settings still tune it
+        if self.Latency is None:
+            self.Latency = max(0.02, min(0.3, max(Pd['Kd'], 0.0) * 0.2))
+        self.LearnAcceleration(Reading, Now, self.Latency)
+        # Zone velocity relative to the fish line; positive is the zone moving down the bar towards a lower line
+        Rel = self.TargetVel - self.WhiteVel
+        self.LearnLatency(Error, Rel, max(Reading['Bottom'] - Reading['Top'], 1))
+
+        # Until the latency passes, the zone keeps accelerating under the input already sent
+        Accel = -self.AccelUp if self.State.MousePressed else self.AccelDown
+        Offset = Rel * self.Latency + 0.5 * Accel * self.Latency ** 2
+        Rel += Accel * self.Latency
+        # Then braking: moving down means holding (AccelUp), moving up means releasing (AccelDown)
+        Brake = self.AccelUp if Rel > 0 else self.AccelDown
+        Offset += Rel * abs(Rel) / (2 * max(Brake, 1.0)) * max(Pd['PdApproachingDamping'], 0.0) / 2.0
+        return Error - max(-MaxLead, min(MaxLead, Offset))
 
     def ControlMinigame(self):
         ScanArea = self.Config.Settings['ScanArea']
@@ -2525,10 +2622,14 @@ class FishingMinigameController:
         Error = WhiteCenter - TargetCenter
         ErrorRate = self.WhiteVel - self.TargetVel
         Closing = (Error > 0 and ErrorRate < 0) or (Error < 0 and ErrorRate > 0)
-        LeadTime = Pd['Kd'] * 0.1 * (Pd['PdApproachingDamping'] if Closing else Pd['PdChasingDamping'])
+        BarLength = max(Reading['Bottom'] - Reading['Top'], 1)
         # Max Correction Clamp caps how far ahead the prediction may look, as a fraction of the bar's length
-        MaxLead = max(Pd['PdClamp'], 0.0) * (Reading['Bottom'] - Reading['Top'])
-        Predicted = Error + max(-MaxLead, min(MaxLead, ErrorRate * LeadTime))
+        MaxLead = max(Pd['PdClamp'], 0.0) * BarLength
+        if IsMac:
+            Predicted = self.PredictByStoppingDistance(Reading, Error, Now, Pd, MaxLead)
+        else:
+            LeadTime = Pd['Kd'] * 0.1 * (Pd['PdApproachingDamping'] if Closing else Pd['PdChasingDamping'])
+            Predicted = Error + max(-MaxLead, min(MaxLead, ErrorRate * LeadTime))
 
         # Hysteresis: inside the deadband keep doing what we were doing, which stops click chatter when centred.
         # Kp is the proportional gain: higher reacts to smaller offsets (1.0 = a half line-height deadband)
@@ -2539,9 +2640,11 @@ class FishingMinigameController:
             ShouldHold = Predicted < 0
         self.SetMouse(ShouldHold, Now)
 
+        Accel = (f" aUp={self.AccelUp:.0f} aDown={self.AccelDown:.0f} lat={self.Latency * 1000:.0f}ms"
+                 if IsMac and self.AccelUp and self.Latency else "")
         self.Trace(Now, f"x={CenterX} white={WhiteCenter} target={TargetCenter} err={Error} "
                         f"vW={self.WhiteVel:.0f} vT={self.TargetVel:.0f} pred={Predicted:.1f} hold={ShouldHold} "
-                        f"groups={Reading['Groups']} bounds={Reading['Top']}-{Reading['Bottom']}")
+                        f"groups={Reading['Groups']} bounds={Reading['Top']}-{Reading['Bottom']}{Accel}")
 
         self.State.PreviousError = Error
         self.State.PreviousTargetY = TargetCenter

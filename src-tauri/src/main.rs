@@ -415,17 +415,40 @@ fn start_window_watcher(app: &AppHandle, backend_port: u16) {
         let mut last_show_overlay: Option<bool> = None;
         // The window starts shown, so only a press of the hide hotkey changes it
         let mut last_hidden = false;
+        #[cfg(target_os = "macos")]
+        let mut last_accessory: Option<bool> = None;
         loop {
             // Short enough that the hide hotkey feels immediate; the live state is a small request
             std::thread::sleep(std::time::Duration::from_millis(400));
             let Some(state) = fetch_live_state(backend_port) else { continue };
 
+            let enabled = state.get("showDebugOverlay").and_then(|v| v.as_bool()).unwrap_or(false);
+            let running = state.get("isRunning").and_then(|v| v.as_bool()).unwrap_or(false);
+            let show_overlay = enabled && running;
+
             let on_top = state.get("alwaysOnTop").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            // Only accessory apps may put windows over another app's full-screen Space, so the policy follows
+            // whichever window currently needs to float over Roblox. Set before pinning: a window ordered in while
+            // the app is still regular stays behind on the desktop Space
+            #[cfg(target_os = "macos")]
+            {
+                let accessory = on_top || show_overlay;
+                if last_accessory != Some(accessory) {
+                    let policy = if accessory { tauri::ActivationPolicy::Accessory } else { tauri::ActivationPolicy::Regular };
+                    let _ = app.set_activation_policy(policy);
+                    last_accessory = Some(accessory);
+                }
+            }
+
             if last_on_top != Some(on_top) {
                 if let Some(win) = app.get_webview_window("fish") {
+                    // On macOS the pin sets the level itself; Tauri's call lands asynchronously on another queue and
+                    // could put it back down to the floating level afterwards
+                    #[cfg(not(target_os = "macos"))]
                     let _ = win.set_always_on_top(on_top);
                     #[cfg(target_os = "macos")]
-                    pin_over_fullscreen(&app, &win, on_top);
+                    pin_over_fullscreen(&win, on_top);
                 }
                 last_on_top = Some(on_top);
             }
@@ -434,16 +457,22 @@ fn start_window_watcher(app: &AppHandle, backend_port: u16) {
             if hidden != last_hidden {
                 if let Some(win) = app.get_webview_window("fish") {
                     let _ = if hidden { win.hide() } else { win.show() };
+                    // Showing again puts it back at the level and Spaces it had, but re-pin in case macOS dropped them
+                    #[cfg(target_os = "macos")]
+                    if !hidden && on_top {
+                        pin_over_fullscreen(&win, true);
+                    }
                 }
                 last_hidden = hidden;
             }
 
-            let enabled = state.get("showDebugOverlay").and_then(|v| v.as_bool()).unwrap_or(false);
-            let running = state.get("isRunning").and_then(|v| v.as_bool()).unwrap_or(false);
-            let show_overlay = enabled && running;
             if last_show_overlay != Some(show_overlay) {
                 if let Some(stats) = app.get_webview_window("stats") {
                     let _ = if show_overlay { stats.show() } else { stats.hide() };
+                    #[cfg(target_os = "macos")]
+                    if show_overlay {
+                        pin_over_fullscreen(&stats, true);
+                    }
                 }
                 last_show_overlay = Some(show_overlay);
             }
@@ -452,14 +481,17 @@ fn start_window_watcher(app: &AppHandle, backend_port: u16) {
 }
 
 // macOS gives a full-screen app its own Space, and a floating window alone stays behind on the desktop. Joining every
-// Space as a full-screen auxiliary follows Roblox there, which macOS only allows for accessory apps, so the Dock icon
-// is hidden while the window is pinned
+// Space as a full-screen auxiliary follows Roblox there (the watcher makes the app an accessory, which macOS requires).
+// Tauri's always-on-top is only the floating level, so this also raises the window to the status level, the same
+// recipe that puts the region selector over full-screen Roblox. A visible window only picks up new Spaces when it is
+// ordered in again, so it is brought back to the front without being activated (Roblox keeps the keyboard)
 #[cfg(target_os = "macos")]
-fn pin_over_fullscreen(app: &AppHandle, win: &tauri::WebviewWindow, on_top: bool) {
+fn pin_over_fullscreen(win: &tauri::WebviewWindow, on_top: bool) {
     use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
 
-    let policy = if on_top { tauri::ActivationPolicy::Accessory } else { tauri::ActivationPolicy::Regular };
-    let _ = app.set_activation_policy(policy);
+    const NORMAL_LEVEL: isize = 0;
+    const STATUS_LEVEL: isize = 25;
+
     let Ok(ns_window) = win.ns_window() else { return };
     let ns_window = ns_window as usize;
     let _ = win.run_on_main_thread(move || {
@@ -467,6 +499,10 @@ fn pin_over_fullscreen(app: &AppHandle, win: &tauri::WebviewWindow, on_top: bool
         let mut behavior = ns_window.collectionBehavior();
         behavior.set(NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary, on_top);
         ns_window.setCollectionBehavior(behavior);
+        ns_window.setLevel(if on_top { STATUS_LEVEL } else { NORMAL_LEVEL });
+        if on_top && ns_window.isVisible() {
+            ns_window.orderFrontRegardless();
+        }
     });
 }
 

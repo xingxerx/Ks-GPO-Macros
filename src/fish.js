@@ -145,8 +145,27 @@ async function toggleMacro() {
     await sendToPython('toggle_macro', '');
 }
 
+// window.confirm only works in WebView2: the macOS webview has no native dialogs and returns false without asking,
+// which made every reset a silent no-op there. This in-page dialog works on both
+function confirmDialog(message) {
+    const modal = document.getElementById('confirmModal');
+    const ok = document.getElementById('confirmOk');
+    const cancel = document.getElementById('confirmCancel');
+    document.getElementById('confirmMessage').textContent = message;
+    modal.classList.remove('hidden');
+    return new Promise(resolve => {
+        const finish = (result) => {
+            modal.classList.add('hidden');
+            ok.onclick = cancel.onclick = null;
+            resolve(result);
+        };
+        ok.onclick = () => finish(true);
+        cancel.onclick = () => finish(false);
+    });
+}
+
 async function resetStats() {
-    if (!confirm('Reset fish, devil fruit and time counters for this session?')) return;
+    if (!await confirmDialog('Reset fish, devil fruit and time counters for this session?')) return;
     await sendToPython('reset_stats', '');
     lastRenderedFruitKey = null;
 }
@@ -682,9 +701,9 @@ async function testBaitScan() {
     showToast(`Found (best first): ${found}`, 'warn');
 }
 
-function confirmResetSettings() {
-    if (confirm('This will reset ALL settings to defaults. This cannot be undone. Continue?')) {
-        if (confirm('Really reset everything?')) {
+async function confirmResetSettings() {
+    if (await confirmDialog('This will reset ALL settings to defaults. This cannot be undone. Continue?')) {
+        if (await confirmDialog('Really reset everything?')) {
             sendToPython('reset_settings', 'confirm').then(async () => {
                 try {
                     const res = await fetch(BackendUrl('/state'));
