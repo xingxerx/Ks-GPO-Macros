@@ -468,6 +468,34 @@ class MacLiveCapture:
             cls.Stream, cls.Output, cls.Region, cls.Frame = None, None, None, None
 
 
+class MacMouseButton:
+    # Presses and releases for the minigame, posted from a background thread. Traces showed each pyautogui
+    # mouseDown/mouseUp on macOS stalling the control loop ~100ms (it also sends a move event and sleeps), so every
+    # steering decision ran on a stale frame and the zone jerked. The loop now only records the wanted state; this
+    # thread posts it straight to the event system at the cursor, as pyautogui would, minus the extra move
+    def __init__(self):
+        self.Wanted = False
+        self.Pending = threading.Event()
+        self.Thread = None
+
+    def Set(self, Down):
+        self.Wanted = Down
+        self.Pending.set()
+        if self.Thread is None:
+            self.Thread = threading.Thread(target=self.Run, daemon=True)
+            self.Thread.start()
+
+    def Run(self):
+        while True:
+            self.Pending.wait()
+            self.Pending.clear()
+            Down = self.Wanted
+            Location = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+            EventType = Quartz.kCGEventLeftMouseDown if Down else Quartz.kCGEventLeftMouseUp
+            Event = Quartz.CGEventCreateMouseEvent(None, EventType, Location, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, Event)
+
+
 def NewScreenCapture():
     return MacScreenCapture(mss.mss()) if IsMac else mss.mss()
 
@@ -1363,9 +1391,15 @@ class BaitListReader:
                     }
                 })
 
-            Baits.sort(key=lambda B: B['Tier'])
             LogLine(f"Bait scan: {[(B['Name'], B['Count']) for B in Baits]}")
-            return Baits
+            # Real list rows always end in "X<count>". A name without one is other UI text: the shop window's
+            # "Common Fish Bait" label after a purchase, or a stray bait label above the list. Clicking those
+            # selected nothing, so drop them, and report a list made only of them as unreadable
+            Counted = [B for B in Baits if B['Count'] is not None]
+            if Baits and not Counted:
+                return None
+            Counted.sort(key=lambda B: B['Tier'])
+            return Counted
 
         except Exception as E:
             print(f"Bait scan error: {E}")
@@ -2273,14 +2307,7 @@ class FishingMinigameController:
     def __init__(self, Config, State):
         self.Config = Config
         self.State = State
-        # Learned zone accelerations (px/s^2), kept across fish (see LearnAcceleration)
-        self.AccelUp = None
-        self.AccelDown = None
-        self.AccelRef = None
         self.InputChangedAt = 0.0
-        self.Latency = None
-        self.LastRelDirection = 0
-        self.SwingPeak = 0.0
 
     def WaitForBobber(self):
         StartTime = time.time()
@@ -2344,10 +2371,12 @@ class FishingMinigameController:
         self.SnapshotReasons = set()
         self.LastTraceTime = 0.0
         self.MinigameStart = time.time()
-        self.AccelRef = None
         self.InputChangedAt = time.time()
-        self.LastRelDirection = 0
-        self.SwingPeak = 0.0
+        self.ThrottleTime = None
+        self.ThrottleDebt = 0.0
+        self.LastStepTime = None
+        self.MaxStep = 0.0
+        self.MaxGrab = 0.0
 
     def Snapshot(self, Image, Reason):
         # One screenshot per reason per minigame, capped per session, so the folder stays small
@@ -2367,6 +2396,8 @@ class FishingMinigameController:
         if Now - self.LastTraceTime >= 0.25:
             self.LastTraceTime = Now
             LogLine(f"MINIGAME t={Now - self.MinigameStart:.2f}s {Message}")
+            self.MaxStep = 0.0
+            self.MaxGrab = 0.0
 
     def BarMissing(self, Now):
         # A single frame without the bar (flicker, capture tearing) must not end the minigame,
@@ -2458,103 +2489,73 @@ class FishingMinigameController:
 
         return {
             'CenterX': CenterX, 'WhiteCenter': WhiteCenter, 'WhiteHeight': WhiteHeight,
-            'TargetCenter': TargetCenter, 'Groups': len(ZoneGroups), 'Top': int(Top), 'Bottom': int(Bottom),
-            'ZoneTop': int(Zone[0]), 'ZoneBottom': int(Zone[-1])
+            'TargetCenter': TargetCenter, 'Groups': len(ZoneGroups), 'Top': int(Top), 'Bottom': int(Bottom)
         }, None
+
+    def PostMouse(self, Down):
+        if IsMac:
+            if getattr(self, 'MouseButton', None) is None:
+                self.MouseButton = MacMouseButton()
+            self.MouseButton.Set(Down)
+        elif Down:
+            pyautogui.mouseDown()
+        else:
+            pyautogui.mouseUp()
 
     def SetMouse(self, Hold, Now):
         if Hold and not self.State.MousePressed:
-            pyautogui.mouseDown()
+            self.PostMouse(True)
             self.State.MousePressed = True
             self.State.LastInputResendTime = Now
             self.InputChangedAt = Now
         elif not Hold and self.State.MousePressed:
-            pyautogui.mouseUp()
+            self.PostMouse(False)
             self.State.MousePressed = False
             self.State.LastInputResendTime = Now
             self.InputChangedAt = Now
         elif Now - getattr(self.State, 'LastInputResendTime', 0) >= self.Config.Settings['FishingControl']['Timing']['StateResendInterval']:
-            if self.State.MousePressed:
-                pyautogui.mouseDown()
-            else:
-                pyautogui.mouseUp()
+            self.PostMouse(self.State.MousePressed)
             self.State.LastInputResendTime = Now
 
-    def LearnAcceleration(self, Reading, Now, Latency):
-        # The zone accelerates up while held and falls while released. Measure each from the zone's velocity change
-        # once the input has been steady long enough to take effect, skipping frames where it rests on a bar end
+    def ThrottleHold(self, Reading, Error, Now, Pd):
+        # The zone has momentum (it rises while held and falls while released, taking over half a second to turn
+        # around at speed), so on/off steering with a look-ahead either overshot or braked early and the zone bobbed
+        # across the fish line. Instead treat the share of time spent holding as a throttle: about half holds the
+        # zone still, more lifts it, less drops it. A PD law picks the throttle from the offset to the fish line and
+        # how fast it's closing, and the hold/release pattern is modulated to deliver it. This tolerates the input
+        # and capture lag without having to know it. Kp scales the response speed (1.0 = 4 rad/s) and Kd the
+        # damping (0.6 = critically damped)
         BarLength = max(Reading['Bottom'] - Reading['Top'], 1)
-        if self.AccelUp is None:
-            # ~2 bar lengths/s^2 both ways, what the zone showed in traces; refined from there
-            self.AccelUp = self.AccelDown = 2.0 * BarLength
+        Wn = 4.0 * max(Pd['Kp'], 0.1)
+        Zeta = max(Pd['Kd'], 0.0) / 0.6
+        # Positive Error means the fish line is below the zone centre, so the zone should accelerate down the bar
+        WantedAccel = Wn * Wn * Error + 2 * Zeta * Wn * (self.WhiteVel - self.TargetVel)
+        # Full hold to full release spans ~3.5 bar lengths/s^2 of acceleration (measured from traces)
+        Duty = max(0.0, min(1.0, 0.5 - WantedAccel / (3.5 * BarLength)))
+
         Held = self.State.MousePressed
-        Pinned = Reading['ZoneTop'] - Reading['Top'] <= 3 or Reading['Bottom'] - Reading['ZoneBottom'] <= 3
-        if Pinned or Now - self.InputChangedAt < Latency + 0.1:
-            self.AccelRef = None
-            return
-        if self.AccelRef is None or self.AccelRef[2] != Held:
-            self.AccelRef = (Now, self.TargetVel, Held)
-            return
-        Dt = Now - self.AccelRef[0]
-        if Dt < 0.15:
-            return
-        Measured = (self.AccelRef[1] - self.TargetVel if Held else self.TargetVel - self.AccelRef[1]) / Dt
-        if 0.3 * BarLength <= Measured <= 10 * BarLength:
-            if Held:
-                self.AccelUp = 0.7 * self.AccelUp + 0.3 * Measured
-            else:
-                self.AccelDown = 0.7 * self.AccelDown + 0.3 * Measured
-        self.AccelRef = (Now, self.TargetVel, Held)
-
-    def LearnLatency(self, Error, Rel, BarLength):
-        # How long an input takes to show up in the captured zone (Roblox, the capture stream and the velocity
-        # filter together) isn't known up front and drifts with frame rate, and the controller is only as good as
-        # this guess. Check it each time the zone turns around from a real swing: stopping past the line means it
-        # braked too late (latency underestimated), stopping short means too early. Hovering on the line makes
-        # the velocity jitter around zero, so turnarounds without a real swing before them are ignored
-        Direction = 1 if Rel > 0 else -1 if Rel < 0 else 0
-        if self.LastRelDirection and Direction and Direction != self.LastRelDirection:
-            if self.SwingPeak >= 0.2 * BarLength and abs(Error) < 0.3 * BarLength:
-                # Positive Overshoot: the zone ended up past the line in the direction it had been moving
-                Overshoot = -Error * self.LastRelDirection
-                self.Latency = max(0.02, min(0.3, self.Latency + 0.0004 * Overshoot))
-            self.SwingPeak = 0.0
-        self.SwingPeak = max(self.SwingPeak, abs(Rel))
-        if Direction:
-            self.LastRelDirection = Direction
-
-    def PredictByStoppingDistance(self, Reading, Error, Now, Pd, MaxLead):
-        # The zone has momentum: in macOS traces it took over half a second to turn around from ~450px/s. A fixed
-        # look-ahead (Error + rate * lead time) can't handle that, since braking distance grows with the square of
-        # speed: short leads overshot and long ones braked early, and either way the zone bobbed around the fish.
-        # Instead predict where the zone would stop if it started braking once the input takes effect, and only
-        # brake when that point reaches the fish line. Latency and both accelerations are learned while fishing;
-        # Kd sets the starting latency (0.6 -> 120ms) and Approaching Damping scales the braking distance
-        # (2.0 = as measured), so the existing settings still tune it
-        if self.Latency is None:
-            self.Latency = max(0.02, min(0.3, max(Pd['Kd'], 0.0) * 0.2))
-        self.LearnAcceleration(Reading, Now, self.Latency)
-        # Zone velocity relative to the fish line; positive is the zone moving down the bar towards a lower line
-        Rel = self.TargetVel - self.WhiteVel
-        self.LearnLatency(Error, Rel, max(Reading['Bottom'] - Reading['Top'], 1))
-
-        # Until the latency passes, the zone keeps accelerating under the input already sent
-        Accel = -self.AccelUp if self.State.MousePressed else self.AccelDown
-        Offset = Rel * self.Latency + 0.5 * Accel * self.Latency ** 2
-        Rel += Accel * self.Latency
-        # Then braking: moving down means holding (AccelUp), moving up means releasing (AccelDown)
-        Brake = self.AccelUp if Rel > 0 else self.AccelDown
-        Offset += Rel * abs(Rel) / (2 * max(Brake, 1.0)) * max(Pd['PdApproachingDamping'], 0.0) / 2.0
-        return Error - max(-MaxLead, min(MaxLead, Offset))
+        Dt = max(0.0, min(0.1, Now - self.ThrottleTime)) if self.ThrottleTime else 0.0
+        self.ThrottleTime = Now
+        # Hold time owed versus delivered; bounded so a long saturated stretch doesn't leave a backlog
+        self.ThrottleDebt = max(-0.1, min(0.1, self.ThrottleDebt + (Duty - (1.0 if Held else 0.0)) * Dt))
+        # Each press or release lasts at least 30ms: Roblox reads the mouse once per frame and can miss shorter ones
+        if Now - self.InputChangedAt < 0.03:
+            return Held, Duty
+        return (self.ThrottleDebt >= 0 if Held else self.ThrottleDebt > 0), Duty
 
     def ControlMinigame(self):
         ScanArea = self.Config.Settings['ScanArea']
         Capture = self.GetCapture()
         Height = ScanArea["Y2"] - ScanArea["Y1"]
 
+        GrabStart = time.time()
         Image = np.array(getattr(Capture, 'grab_live', Capture.grab)({"top": ScanArea["Y1"], "left": ScanArea["X1"],
                                        "width": ScanArea["X2"] - ScanArea["X1"], "height": Height}))
         Now = time.time()
+        self.MaxGrab = max(self.MaxGrab, Now - GrabStart)
+        if self.LastStepTime:
+            self.MaxStep = max(self.MaxStep, Now - self.LastStepTime)
+        self.LastStepTime = Now
         self.Snapshot(Image, 'start')
 
         if ColorDetector.DetectBlackScreen(ScanArea, Image, self.Config.Settings['FishingControl']['Detection']['BlackScreenThreshold']):
@@ -2620,31 +2621,32 @@ class FishingMinigameController:
 
         # Hold raises the catch zone (target); aim where fish line and zone will be shortly so momentum doesn't overshoot
         Error = WhiteCenter - TargetCenter
-        ErrorRate = self.WhiteVel - self.TargetVel
-        Closing = (Error > 0 and ErrorRate < 0) or (Error < 0 and ErrorRate > 0)
-        BarLength = max(Reading['Bottom'] - Reading['Top'], 1)
-        # Max Correction Clamp caps how far ahead the prediction may look, as a fraction of the bar's length
-        MaxLead = max(Pd['PdClamp'], 0.0) * BarLength
         if IsMac:
-            Predicted = self.PredictByStoppingDistance(Reading, Error, Now, Pd, MaxLead)
+            ShouldHold, Duty = self.ThrottleHold(Reading, Error, Now, Pd)
+            Decision = f"duty={Duty:.2f}"
         else:
+            ErrorRate = self.WhiteVel - self.TargetVel
+            Closing = (Error > 0 and ErrorRate < 0) or (Error < 0 and ErrorRate > 0)
             LeadTime = Pd['Kd'] * 0.1 * (Pd['PdApproachingDamping'] if Closing else Pd['PdChasingDamping'])
+            # Max Correction Clamp caps how far ahead the prediction may look, as a fraction of the bar's length
+            MaxLead = max(Pd['PdClamp'], 0.0) * (Reading['Bottom'] - Reading['Top'])
             Predicted = Error + max(-MaxLead, min(MaxLead, ErrorRate * LeadTime))
 
-        # Hysteresis: inside the deadband keep doing what we were doing, which stops click chatter when centred.
-        # Kp is the proportional gain: higher reacts to smaller offsets (1.0 = a half line-height deadband)
-        Deadband = max(2.0, WhiteHeight * 0.5) / max(Pd['Kp'], 0.1)
-        if abs(Predicted) < Deadband:
-            ShouldHold = self.State.MousePressed
-        else:
-            ShouldHold = Predicted < 0
+            # Hysteresis: inside the deadband keep doing what we were doing, which stops click chatter when centred.
+            # Kp is the proportional gain: higher reacts to smaller offsets (1.0 = a half line-height deadband)
+            Deadband = max(2.0, WhiteHeight * 0.5) / max(Pd['Kp'], 0.1)
+            if abs(Predicted) < Deadband:
+                ShouldHold = self.State.MousePressed
+            else:
+                ShouldHold = Predicted < 0
+            Decision = f"pred={Predicted:.1f}"
         self.SetMouse(ShouldHold, Now)
 
-        Accel = (f" aUp={self.AccelUp:.0f} aDown={self.AccelDown:.0f} lat={self.Latency * 1000:.0f}ms"
-                 if IsMac and self.AccelUp and self.Latency else "")
+        # Slowest frame-to-frame step since the last trace line: a stalled loop shows up here
         self.Trace(Now, f"x={CenterX} white={WhiteCenter} target={TargetCenter} err={Error} "
-                        f"vW={self.WhiteVel:.0f} vT={self.TargetVel:.0f} pred={Predicted:.1f} hold={ShouldHold} "
-                        f"groups={Reading['Groups']} bounds={Reading['Top']}-{Reading['Bottom']}{Accel}")
+                        f"vW={self.WhiteVel:.0f} vT={self.TargetVel:.0f} {Decision} hold={ShouldHold} "
+                        f"groups={Reading['Groups']} bounds={Reading['Top']}-{Reading['Bottom']} "
+                        f"maxstep={self.MaxStep * 1000:.0f}ms maxgrab={self.MaxGrab * 1000:.0f}ms")
 
         self.State.PreviousError = Error
         self.State.PreviousTargetY = TargetCenter
@@ -3430,7 +3432,7 @@ class AutomatedFishingSystem:
             return False
 
         self.State.UpdateStatus("Scanning bait list")
-        Baits = self.BaitReader.ScanBaits()
+        Baits = self.ScanBaitList()
         self.State.TopBaitCounter = 1
         self.State.BaitRescanNeeded = False
 
@@ -3450,7 +3452,7 @@ class AutomatedFishingSystem:
                 return False
 
             self.State.UpdateStatus("Rescanning bait list")
-            Baits = self.BaitReader.ScanBaits()
+            Baits = self.ScanBaitList()
             PurchaseFailed = Baits is not None and not any(B['Tier'] == ShopTier for B in Baits)
 
         if not Baits:
@@ -3480,6 +3482,17 @@ class AutomatedFishingSystem:
             self.NotifyBaitChange(f"Bait switched: {Previous} → {Best['Name']}" + (f" (x{Best['Count']})" if Best['Count'] is not None else "") + Reason)
 
         return True
+
+    def ScanBaitList(self, Attempts=4, RetryDelay=0.4):
+        # The bait panel takes a moment to appear after equipping the rod, and right after a purchase the shop
+        # window can still cover it, so keep scanning until real bait rows show up
+        Baits = None
+        for Attempt in range(Attempts):
+            Baits = self.BaitReader.ScanBaits()
+            if Baits or not self.OcrManager.Enabled or not self.State.IsRunning:
+                return Baits
+            time.sleep(RetryDelay)
+        return Baits
 
     def ShopBaitTier(self):
         # Auto Buy purchases the bait the shop sells; find where it sits in the tier order. Without it in the list,

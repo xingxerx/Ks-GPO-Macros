@@ -15,28 +15,6 @@ const MACROS = [
         color: '#4f8ef7',
         icon: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 16.5a2 2 0 1 1-4 0c0-1.1 2-4 2-4s2 2.9 2 4z"/><path d="M4 18h2M6 14c0 0 2-2 4-2s4 2 4 2"/><line x1="6" y1="18" x2="6" y2="10"/><line x1="6" y1="10" x2="18" y2="4"/></svg>`,
     },
-    {
-        id: 'mihawk',
-        name: 'Mihawk Macro',
-        comingSoon: true,
-        desc: 'Precision Mihawk boss automation with dodge and DPS logic.',
-        tag: 'MIHAWK',
-        free: false,
-        visible: true,
-        color: '#e0b854',
-        icon: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><polyline points="8 6 18 6 18 16"/></svg>`,
-    },
-    {
-        id: 'roger',
-        name: 'Roger Macro',
-        comingSoon: true,
-        desc: 'Full Roger raid loop with phase detection and auto-heal.',
-        tag: 'ROGER',
-        free: false,
-        visible: true,
-        color: '#e05555',
-        icon: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>`,
-    },
 ];
 
 function hexToRgb(hex) {

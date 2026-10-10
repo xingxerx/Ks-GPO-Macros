@@ -131,14 +131,18 @@ async function launchApp() {
 
     await sleep(200);
 
+    // Starts the fishing macro directly (the only one available) and closes this window once it's up
     try {
         await invoke('open_main_window');
-    } catch (_) {
-        window.location.href = 'hub.html';
+        setStatus('Ready', 'active');
+    } catch (e) {
+        const msg = String(e?.message || e || 'Failed to start').replace(/[<>&]/g, '');
+        appendLog(`Could not start the fishing macro: ${msg}`, 'warn');
+        setStatus('Launch failed', 'error');
+        setLaunchBtn('Retry', true, true);
     }
 
     setTimeout(() => overlay.classList.remove('go'), 400);
-    setStatus('Ready', 'active');
 }
 
 async function checkForUpdates() {

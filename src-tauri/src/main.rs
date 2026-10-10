@@ -580,12 +580,11 @@ fn launch_macro(app: AppHandle, macro_name: String) -> Result<serde_json::Value,
     Ok(serde_json::json!({ "port": port }))
 }
 
+// Fishing is the only available macro, so the launcher goes straight into it instead of through the hub. The
+// launcher stays open on failure so it can show the error
 #[tauri::command]
 fn open_main_window(app: AppHandle) -> Result<(), String> {
-    if let Some(hub) = app.get_webview_window("hub") {
-        hub.show().map_err(|e| e.to_string())?;
-        hub.set_focus().map_err(|e| e.to_string())?;
-    }
+    launch_macro(app.clone(), "fishing".to_string())?;
     if let Some(launcher) = app.get_webview_window("launcher") {
         let _ = launcher.close();
     }
